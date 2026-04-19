@@ -1,0 +1,13 @@
+[package]
+name = "radius-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+radius = { git = "https://github.com/ogital-net/radius-rs", default-features = false, features = ["md5"] }
+log = "0.4"
+env_logger = "0.8"
+tokio = { version = "1", features = ["net", "signal", "macros", "rt-multi-thread"] }
+hmac = "0.12"
+md-5 = "0.10"
+digest = "0.10"
