@@ -7,7 +7,23 @@ edition = "2021"
 radius = { git = "https://github.com/ogital-net/radius-rs", default-features = false, features = ["md5"] }
 log = "0.4"
 env_logger = "0.8"
-tokio = { version = "1", features = ["net", "signal", "macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["net", "signal", "macros", "rt-multi-thread", "fs"] }
 hmac = "0.12"
 md-5 = "0.10"
 digest = "0.10"
+
+# Web server
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors"] }
+serde = { version = "1", features = ["derive"] }
+askama = "0.12"
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+
+# Password hashing
+argon2 = "0.5"
+rand = "0.8"
+
+# Util
+urlencoding = "2"

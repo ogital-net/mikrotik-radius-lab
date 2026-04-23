@@ -308,50 +308,173 @@ start_client() {
     log "Client VM running (PID $(cat "$PID_DIR/client.pid"))"
 }
 
-# ─── Configure Mikrotik via serial ──────────────────────────────
+# ─── Configure Mikrotik via serial (expect) ───────────────────
 
 configure_mikrotik() {
     local boot_wait="${MIKROTIK_BOOT_WAIT:-$CHR_BOOT_DEFAULT}"
     log "Waiting ${boot_wait}s for RouterOS to boot..."
     sleep "$boot_wait"
 
-    log "Sending configuration via serial (port 4444)..."
+    log "Configuring RouterOS via serial (expect)..."
 
-    {
-        sleep 2
-        # Login sequence: admin, empty password, set new password
-        # Note: some versions show a license prompt (Enter skips it)
-        printf "\r\n"
+    # Write a self-contained expect script to a temp file to avoid heredoc escaping issues
+    local expect_script
+    expect_script="$(mktemp /tmp/mikrotik-config.XXXXXX.exp)"
+
+    cat > "$expect_script" << 'EXPECT_SCRIPT'
+set timeout 30
+set config_file [lindex $argv 0]
+
+# Match the RouterOS prompt: "[admin@MikroTik] > " or similar
+set prompt {\] > $}
+
+spawn socat - tcp:localhost:4444,connect-timeout=120
+
+# Wake up the console
+send "\r"
+
+# Handle first-boot flow: login -> password -> new password -> license
+expect {
+    -re {[Ll]ogin:} {
+        send "admin\r"
+    }
+    timeout {
+        puts "timeout waiting for login prompt"
+        exit 1
+    }
+}
+
+expect {
+    -re {[Pp]assword:} {
+        send "\r"
+    }
+}
+
+# RouterOS 7.x first boot: new password prompt or license, or straight to shell
+expect {
+    -re {new password|[Cc]hange.*[Pp]assword} {
+        send "admin\r"
+        expect -re {repeat|again|confirm|new password}
+        send "admin\r"
+        expect {
+            -re {agreement|license|\[Y\]} {
+                send "Y\r"
+                expect -re $prompt
+            }
+            -re $prompt {}
+        }
+    }
+    -re {agreement|license|\[Y\]} {
+        send "Y\r"
+        expect -re $prompt
+    }
+    -re $prompt {}
+}
+
+# Read config file and send each command
+set fp [open $config_file r]
+while {[gets $fp line] >= 0} {
+    set line [string trim $line]
+    if {$line eq "" || [string index $line 0] eq "#"} continue
+    send "$line\r"
+    expect {
+        -re $prompt {}
+        -re {invalid command|bad command|failure:} {
+            puts "WARNING: command may have failed: $line"
+            expect -re $prompt
+        }
+        timeout {
+            puts "timeout after: $line"
+            exit 1
+        }
+    }
+}
+close $fp
+
+send "\r"
+expect -re $prompt
+
+puts "\nconfiguration applied successfully"
+close
+EXPECT_SCRIPT
+
+    expect "$expect_script" "$CONFIGS_DIR/mikrotik-hotspot.rsc"
+    local rc=$?
+    rm -f "$expect_script"
+
+    if [ $rc -eq 0 ]; then
+        log "Configuration applied"
+    else
+        warn "Auto-config may have failed"
+        info "Connect manually: socat -,rawer tcp:localhost:4444"
+        info "Then paste commands from: configs/mikrotik-hotspot.rsc"
+    fi
+}
+
+# ─── Upload custom HotSpot HTML to Mikrotik via SCP ──────────
+
+upload_hotspot_html() {
+    log "Uploading custom hotspot HTML pages to Mikrotik (SCP)..."
+
+    local expect_script
+    expect_script="$(mktemp /tmp/mikrotik-scp.XXXXXX.exp)"
+
+    cat > "$expect_script" << 'SCP_SCRIPT'
+set timeout 20
+set src [lindex $argv 0]
+set dst [lindex $argv 1]
+
+spawn scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -P 2222 $src admin@localhost:$dst
+
+expect {
+    -re {[Pp]assword:} {
+        send "admin\r"
+        exp_continue
+    }
+    "100%" {
+        exit 0
+    }
+    eof {
+        exit 0
+    }
+    timeout {
+        exit 1
+    }
+}
+SCP_SCRIPT
+
+    local retries=10
+    local uploaded=0
+
+    # Wait for SSH to be reachable
+    for i in $(seq 1 $retries); do
+        if expect "$expect_script" /dev/null /dev/null 2>/dev/null; then
+            break
+        fi
         sleep 3
-        printf "admin\r\n"
-        sleep 2
-        # Empty password (current default)
-        printf "\r\n"
-        sleep 3
-        # Enter skips license prompt if present, harmless otherwise
-        printf "\r\n"
-        sleep 3
-        # New password prompt (required on fresh RouterOS 7.x)
-        printf "admin\r\n"
-        sleep 2
-        # Repeat new password
-        printf "admin\r\n"
-        sleep 5
+    done
 
-        # Send config commands
-        while IFS= read -r line; do
-            [[ -z "$line" || "$line" == \#* ]] && continue
-            printf "%s\r\n" "$line"
-            sleep 2
-        done < "$CONFIGS_DIR/mikrotik-hotspot.rsc"
+    for html_file in "$CONFIGS_DIR"/hotspot-html/*.html; do
+        [ -f "$html_file" ] || continue
+        local fname
+        fname="$(basename "$html_file")"
 
-        sleep 2
-    } | socat - tcp:localhost:4444,connect-timeout=120 > /dev/null 2>&1 || true
+        if expect "$expect_script" "$html_file" "/hotspot/$fname"; then
+            info "  uploaded $fname"
+            uploaded=$((uploaded + 1))
+        else
+            warn "  failed to upload $fname"
+        fi
+    done
 
-    log "Configuration sent"
-    warn "If auto-config failed, connect manually:"
-    info "  socat -,rawer tcp:localhost:4444"
-    info "  Then paste commands from: configs/mikrotik-hotspot.rsc"
+    rm -f "$expect_script"
+
+    if [ "$uploaded" -gt 0 ]; then
+        log "Uploaded $uploaded hotspot HTML file(s)"
+    else
+        warn "Could not upload HTML files"
+        info "Upload manually: scp -P 2222 configs/hotspot-html/*.html admin@localhost:/hotspot/"
+    fi
 }
 
 # ─── Stop all ───────────────────────────────────────────────────
@@ -463,6 +586,7 @@ main() {
     start_radius
     start_mikrotik
     configure_mikrotik
+    upload_hotspot_html
     start_client
 
     echo ""

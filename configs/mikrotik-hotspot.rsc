@@ -21,3 +21,6 @@
 # HotSpot profile + server
 /ip hotspot profile add name=hsprof1 hotspot-address=192.168.88.1 dns-name=hotspot.lab login-by=http-pap use-radius=yes
 /ip hotspot add name=hs1 interface=ether2 address-pool=hotspot-pool profile=hsprof1 disabled=no
+
+# Walled garden: allow unauthenticated clients to reach the portal web server (host)
+/ip hotspot walled-garden ip add dst-address=10.0.2.2 dst-port=8080 protocol=tcp action=accept
