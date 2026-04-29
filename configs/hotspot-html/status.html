@@ -1,0 +1,15 @@
+<html>
+<head><title>Redirecting...</title></head>
+<body>
+<script>
+    window.location.href = "http://10.0.2.2:8080/status"
+        + "?username=" + encodeURIComponent("$(username)")
+        + "&mac=" + encodeURIComponent("$(mac)")
+        + "&ip=" + encodeURIComponent("$(ip)")
+        + "&uptime=" + encodeURIComponent("$(uptime)")
+        + "&bytes_in=" + encodeURIComponent("$(bytes-in-nice)")
+        + "&bytes_out=" + encodeURIComponent("$(bytes-out-nice)")
+        + "&session_id=" + encodeURIComponent("$(session-id)");
+</script>
+</body>
+</html>

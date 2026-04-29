@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+
+{% block title %}Latigo - Disconnected{% endblock %}
+{% block subtitle %}Session Ended{% endblock %}
+
+{% block content %}
+<div class="info" style="margin-bottom: 1.5rem;">
+    <p>You have been disconnected, <strong>{{ username }}</strong>.</p>
+</div>
+
+<div class="session-info">
+    <dl>
+        <dt>Device</dt>
+        <dd>{{ mac }}</dd>
+    </dl>
+</div>
+
+<a href="/login" class="btn">Reconnect</a>
+{% endblock %}

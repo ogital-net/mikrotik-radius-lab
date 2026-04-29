@@ -1,0 +1,23 @@
+[package]
+name = "mikrotik-ingester"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+clickhouse = { version = "0.13", features = ["inserter", "time"] }
+serde = { version = "1", features = ["derive"] }
+axum = "0.8"
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+time = { version = "0.3", features = ["serde", "macros"] }
+syslog_loose = "0.23.0"
+chrono = { version = "0.4.44", default-features = false, features = ["std"] }
+regex = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

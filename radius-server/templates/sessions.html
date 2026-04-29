@@ -1,0 +1,72 @@
+{% extends "base.html" %}
+
+{% block title %}Latigo - Sessions{% endblock %}
+{% block subtitle %}Active Sessions{% endblock %}
+
+{% block content %}
+<style>
+    table { width: 100%; border-collapse: collapse; margin-top: 1rem; font-size: 0.8rem; }
+    th, td { text-align: left; padding: 0.5rem; border-bottom: 1px solid #334155; }
+    th { color: #64748b; text-transform: uppercase; font-size: 0.7rem; letter-spacing: 0.05em; }
+    .badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 4px; font-size: 0.7rem; font-weight: 600; }
+    .badge-active { background: #14532d; color: #86efac; }
+    .badge-closed { background: #1e293b; color: #64748b; }
+    .section-title { color: #94a3b8; font-size: 0.875rem; margin-top: 1.5rem; margin-bottom: 0.5rem; }
+    .empty { color: #64748b; font-size: 0.875rem; text-align: center; padding: 1.5rem 0; }
+</style>
+
+{% if active_sessions.is_empty() && closed_sessions.is_empty() %}
+<p class="empty">No sessions recorded yet.</p>
+{% endif %}
+
+{% if !active_sessions.is_empty() %}
+<table>
+    <thead>
+        <tr>
+            <th>User</th>
+            <th>IP</th>
+            <th>Time</th>
+            <th>In / Out</th>
+            <th>Status</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for s in active_sessions %}
+        <tr>
+            <td>{{ s.username }}<br><span style="color:#64748b;font-size:0.7rem">{{ s.mac_address }}</span></td>
+            <td>{{ s.ip_address }}</td>
+            <td>{{ s.duration }}</td>
+            <td>{{ s.bytes_in_fmt }} / {{ s.bytes_out_fmt }}</td>
+            <td><span class="badge badge-active">active</span></td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% endif %}
+
+{% if !closed_sessions.is_empty() %}
+<p class="section-title">Recent</p>
+<table>
+    <thead>
+        <tr>
+            <th>User</th>
+            <th>IP</th>
+            <th>Time</th>
+            <th>In / Out</th>
+            <th>Cause</th>
+        </tr>
+    </thead>
+    <tbody>
+        {% for s in closed_sessions %}
+        <tr>
+            <td>{{ s.username }}<br><span style="color:#64748b;font-size:0.7rem">{{ s.mac_address }}</span></td>
+            <td>{{ s.ip_address }}</td>
+            <td>{{ s.duration }}</td>
+            <td>{{ s.bytes_in_fmt }} / {{ s.bytes_out_fmt }}</td>
+            <td><span class="badge badge-closed">{{ s.terminate_cause }}</span></td>
+        </tr>
+        {% endfor %}
+    </tbody>
+</table>
+{% endif %}
+{% endblock %}

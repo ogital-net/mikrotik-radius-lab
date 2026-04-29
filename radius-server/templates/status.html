@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+
+{% block title %}Latigo - Session{% endblock %}
+{% block subtitle %}Session Status{% endblock %}
+
+{% block content %}
+<div class="session-info">
+    <dl>
+        <dt>Username</dt>
+        <dd>{{ username }}</dd>
+        <dt>Device</dt>
+        <dd>{{ mac }}</dd>
+        <dt>IP Address</dt>
+        <dd>{{ ip }}</dd>
+        <dt>Uptime</dt>
+        <dd>{{ uptime }}</dd>
+        <dt>Downloaded</dt>
+        <dd>{{ bytes_in }}</dd>
+        <dt>Uploaded</dt>
+        <dd>{{ bytes_out }}</dd>
+    </dl>
+</div>
+
+<form method="GET" action="/logout">
+    <input type="hidden" name="mac" value="{{ mac }}">
+    <input type="hidden" name="ip" value="{{ ip }}">
+    <input type="hidden" name="username" value="{{ username }}">
+    <button type="submit" class="btn btn-secondary">Disconnect</button>
+</form>
+{% endblock %}

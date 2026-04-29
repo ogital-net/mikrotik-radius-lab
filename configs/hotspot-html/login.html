@@ -1,0 +1,16 @@
+<html>
+<head><title>Redirecting...</title></head>
+<body>
+<p>Redirecting to Latigo portal...</p>
+<script>
+    window.location.href = "http://10.0.2.2:8080/login"
+        + "?link_login=" + encodeURIComponent("$(link-login-only)")
+        + "&link_orig=" + encodeURIComponent("$(link-orig)")
+        + "&mac=" + encodeURIComponent("$(mac)")
+        + "&ip=" + encodeURIComponent("$(ip)");
+</script>
+<noscript>
+    <meta http-equiv="refresh" content="0; url=http://10.0.2.2:8080/login?link_login=$(link-login-only)&link_orig=$(link-orig)&mac=$(mac)&ip=$(ip)">
+</noscript>
+</body>
+</html>

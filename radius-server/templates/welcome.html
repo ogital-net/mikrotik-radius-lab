@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+
+{% block title %}Latigo - Connected{% endblock %}
+{% block subtitle %}You're connected{% endblock %}
+
+{% block content %}
+<div class="success">
+    Welcome, <strong>{{ username }}</strong>! You are now online.
+</div>
+
+<div class="session-info">
+    <dl>
+        <dt>Device</dt>
+        <dd>{{ mac }}</dd>
+        <dt>IP Address</dt>
+        <dd>{{ ip }}</dd>
+    </dl>
+</div>
+
+<a href="/status?mac={{ mac|urlencode }}&ip={{ ip|urlencode }}&username={{ username|urlencode }}" class="btn btn-secondary">View Session</a>
+
+{% if !link_orig.is_empty() %}
+<p class="info" id="redirect-msg">Redirecting to your page in <span id="countdown">3</span>s...</p>
+<script>
+    let secs = 3;
+    const el = document.getElementById("countdown");
+    const timer = setInterval(() => {
+        secs--;
+        el.textContent = secs;
+        if (secs <= 0) {
+            clearInterval(timer);
+            window.location.href = "{{ link_orig }}";
+        }
+    }, 1000);
+</script>
+{% endif %}
+{% endblock %}

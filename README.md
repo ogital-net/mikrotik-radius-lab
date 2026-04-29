@@ -1,26 +1,31 @@
 # Captive Portal Lab
 
-Local lab that simulates a real-world captive portal scenario using Mikrotik CHR, a Rust RADIUS server, and a client VM with a browser.
+Local lab that simulates a real-world captive portal scenario using Mikrotik CHR, a Rust RADIUS server, a Rust compliance log ingester writing to ClickHouse, and a client VM with a browser.
 
 ```
                                     Host (macOS)
-                                    ┌──────────────────────────┐
-                                    │  RADIUS Server (Rust)    │
-                                    │  0.0.0.0:1812            │
-┌──────────────┐   QEMU socket    ┌─┴────────────────┐        │
-│ Lubuntu VM   │◄────────────────►│ Mikrotik CHR VM  │        │
-│ (client)     │   192.168.88.0/24│ (arm64 or x64)   │        │
-│              │                  │                  │        │
-│ Firefox      │                  │ ether1: WAN/NAT  ├──NAT───┤──► Internet
-│ DHCP client  │                  │ ether2: HotSpot  │ 10.0.2.x    │
-└──────────────┘                  └──────────────────┘        │
-                                    └──────────────────────────┘
+                                    ┌────────────────────────────────────┐
+                                    │  RADIUS Server (Rust)  0.0.0.0:1812│
+                                    │  Ingester (Rust)       0.0.0.0:5140│
+                                    │  ClickHouse (docker)   0.0.0.0:8123│
+┌──────────────┐   QEMU socket    ┌─┴────────────────┐                  │
+│ Lubuntu VM   │◄────────────────►│ Mikrotik CHR VM  │                  │
+│ (client)     │   192.168.88.0/24│ (arm64 or x64)   │                  │
+│              │                  │                  │                  │
+│ Firefox      │                  │ ether1: WAN/NAT  ├──NAT─────────────┤──► Internet
+│ DHCP client  │                  │ ether2: HotSpot  │ 10.0.2.x         │
+└──────────────┘                  └──────────────────┘                  │
+                                                                        │
+                                       firewall log → CEF/TCP → 10.0.2.2:5140
+                                                                        │
+                                    └────────────────────────────────────┘
 ```
 
 ## Prerequisites
 
 ```bash
 brew install qemu socat
+# Docker Desktop (for ClickHouse). Must be running before `./run.sh`.
 # Rust (if not installed)
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
@@ -122,12 +127,51 @@ See [HotSpot Configuration](#hotspot-configuration) above.
 ## Project Structure
 
 ```
-├── run.sh                       # main script -- starts everything
+├── run.sh                            # main script -- starts everything
 ├── configs/
-│   └── mikrotik-hotspot.rsc     # RouterOS HotSpot + RADIUS config
+│   ├── mikrotik-hotspot.rsc          # RouterOS HotSpot + RADIUS config
+│   └── mikrotik-logging.rsc          # CEF/TCP logging + firewall log rule
 ├── radius-server/
 │   ├── Cargo.toml
-│   └── src/main.rs              # RADIUS server (radius-rs + manual HMAC)
-├── test-radius.py               # diagnostic Python RADIUS server
-└── images/                      # downloaded VM images (gitignored)
+│   └── src/
+│       ├── main.rs                   # RADIUS server (radius-rs + manual HMAC) + captive-portal web UI
+│       └── audit.rs                  # streams session events to ClickHouse for the audit join
+├── mikrotik-ingester/                # Compliance log ingester
+│   ├── Cargo.toml
+│   ├── docker-compose.yml            # ClickHouse server
+│   ├── migrations/                   # versioned ClickHouse schema migrations
+│   ├── src/                          # CEF parser + TCP listener + Inserter
+│   └── README.md                     # design notes + operations guide
+├── test-radius.py                    # diagnostic Python RADIUS server
+└── images/                           # downloaded VM images (gitignored)
 ```
+
+## Compliance Logging
+
+Two streams land in the same ClickHouse instance:
+
+- `firewall_connections` — written by `mikrotik-ingester` from the Mikrotik CEF/TCP firewall log (`src_mac`, src/dst IPs+ports, proto, timestamps).
+- `radius_session_events` — written by `radius-server` on every RADIUS Accounting Start/Interim/Stop (`username`, `mac`, `framed_ip`, byte counters, terminate-cause).
+
+The two are joined by **MAC + timestamp** (`ASOF JOIN`) to answer "who was on this connection at this time." See [`mikrotik-ingester/README.md`](mikrotik-ingester/README.md) for the full design rationale, schema, and the audit-join query.
+
+```bash
+# Watch the firewall events as they arrive
+open http://localhost:8123/play
+
+# Or query directly
+curl -s -u ingester:ingester -G --data-urlencode \
+  'query=SELECT count() FROM mikrotik.firewall_connections' \
+  http://localhost:8123/
+```
+
+### When Mikrotik logging gets stuck
+
+If the ingester restarts, the Mikrotik may hold a stale TCP session and not reconnect on the next event. To force it:
+
+```routeros
+/system logging remove [find action=cefremote]
+/system logging add topics=firewall action=cefremote
+```
+
+(Bouncing the action via `disabled` doesn't work — `disabled` is not a valid property on `/system logging action`. The rule under `/system logging` does have `disabled=yes/no` if you prefer.)

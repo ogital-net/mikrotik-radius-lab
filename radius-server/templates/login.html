@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+
+{% block title %}Latigo - Sign In{% endblock %}
+{% block subtitle %}Sign in to connect{% endblock %}
+
+{% block content %}
+{% if let Some(error) = error %}
+<div class="error">{{ error }}</div>
+{% endif %}
+
+<form method="POST" action="/login">
+    <input type="hidden" name="link_login" value="{{ link_login }}">
+    <input type="hidden" name="link_orig" value="{{ link_orig }}">
+    <input type="hidden" name="mac" value="{{ mac }}">
+    <input type="hidden" name="ip" value="{{ ip }}">
+
+    <div class="form-group">
+        <label for="username">Username</label>
+        <input type="text" id="username" name="username" required autofocus>
+    </div>
+    <div class="form-group">
+        <label for="password">Password</label>
+        <input type="password" id="password" name="password" required>
+    </div>
+    <button type="submit" class="btn">Connect</button>
+</form>
+
+<div class="info">
+    <p>Don't have an account? <a href="/register?link_login={{ link_login|urlencode }}&link_orig={{ link_orig|urlencode }}&mac={{ mac|urlencode }}&ip={{ ip|urlencode }}">Sign up</a></p>
+</div>
+{% endblock %}

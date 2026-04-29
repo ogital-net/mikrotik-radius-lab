@@ -12,6 +12,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IMAGES_DIR="$SCRIPT_DIR/images"
 CONFIGS_DIR="$SCRIPT_DIR/configs"
 RADIUS_DIR="$SCRIPT_DIR/radius-server"
+INGESTER_DIR="$SCRIPT_DIR/mikrotik-ingester"
 PID_DIR="$SCRIPT_DIR/.run"
 
 HOST_ARCH="$(uname -m)"
@@ -216,6 +217,46 @@ build_radius() {
     log "RADIUS server built"
 }
 
+build_ingester() {
+    log "Building Mikrotik ingester..."
+    (cd "$INGESTER_DIR" && cargo build --release 2>&1 | tail -5)
+    log "Ingester built"
+}
+
+start_clickhouse() {
+    log "Starting ClickHouse via docker compose..."
+    (cd "$INGESTER_DIR" && docker compose up -d) >/dev/null 2>&1 || {
+        err "docker compose up failed (is Docker running?)"
+        exit 1
+    }
+    for _ in $(seq 1 30); do
+        if curl -sf -u ingester:ingester 'http://localhost:8123/ping' >/dev/null 2>&1; then
+            log "ClickHouse ready (http://localhost:8123/play)"
+            return
+        fi
+        sleep 1
+    done
+    err "ClickHouse did not become ready"
+    exit 1
+}
+
+start_ingester() {
+    mkdir -p "$PID_DIR"
+    log "Starting Mikrotik ingester on 0.0.0.0:5140..."
+
+    RUST_LOG=info "$INGESTER_DIR/target/release/mikrotik-ingester" \
+        > "$PID_DIR/ingester.log" 2>&1 &
+    echo $! > "$PID_DIR/ingester.pid"
+
+    sleep 1
+    if kill -0 "$(cat "$PID_DIR/ingester.pid")" 2>/dev/null; then
+        log "Ingester running (PID $(cat "$PID_DIR/ingester.pid"))"
+    else
+        err "Ingester failed to start; see $PID_DIR/ingester.log"
+        exit 1
+    fi
+}
+
 # ─── Start RADIUS ──────────────────────────────────────────────
 
 start_radius() {
@@ -322,54 +363,98 @@ configure_mikrotik() {
     expect_script="$(mktemp /tmp/mikrotik-config.XXXXXX.exp)"
 
     cat > "$expect_script" << 'EXPECT_SCRIPT'
-set timeout 30
+set timeout 60
 set config_file [lindex $argv 0]
 
+log_user 1
+
 # Match the RouterOS prompt: "[admin@MikroTik] > " or similar
-set prompt {\] > $}
+# Use a loose pattern to handle ANSI escape codes on serial
+set prompt {> $}
 
 spawn socat - tcp:localhost:4444,connect-timeout=120
 
-# Wake up the console
+# Wait for socat connection to establish
+sleep 2
+
+# Send a few enters to trigger the login prompt, then drain any initial output.
+# RouterOS often resets the console on first connect — we need to wait for it
+# to settle before attempting login.
+send "\r"
+sleep 3
+
+# Drain: consume everything buffered so far (the first login prompt that gets reset)
+expect *
+
+# Now send enter to get the real, stable login prompt
 send "\r"
 
-# Handle first-boot flow: login -> password -> new password -> license
-expect {
-    -re {[Ll]ogin:} {
-        send "admin\r"
-    }
-    timeout {
-        puts "timeout waiting for login prompt"
-        exit 1
-    }
-}
+# Procedure to log in: tries empty password first (first boot), then "admin"
+proc do_login {} {
+    global prompt
 
-expect {
-    -re {[Pp]assword:} {
-        send "\r"
-    }
-}
-
-# RouterOS 7.x first boot: new password prompt or license, or straight to shell
-expect {
-    -re {new password|[Cc]hange.*[Pp]assword} {
-        send "admin\r"
-        expect -re {repeat|again|confirm|new password}
-        send "admin\r"
-        expect {
-            -re {agreement|license|\[Y\]} {
-                send "Y\r"
-                expect -re $prompt
-            }
-            -re $prompt {}
+    expect {
+        -re {[Ll]ogin:} {}
+        -re $prompt { return }
+        timeout {
+            puts "timeout waiting for login prompt"
+            exit 1
         }
     }
-    -re {agreement|license|\[Y\]} {
-        send "Y\r"
-        expect -re $prompt
+
+    send "admin\r"
+
+    expect {
+        -re {[Pp]assword:} {
+            # Try empty password first (first boot)
+            send "\r"
+        }
+        -re $prompt { return }
+        timeout {
+            puts "timeout waiting for password prompt"
+            exit 1
+        }
     }
-    -re $prompt {}
+
+    # Check what happens after password
+    expect {
+        -re {[Ll]ogin failed|incorrect} {
+            # Empty password failed — router already configured, password is "admin"
+            # Wait for the console to reset and show login again
+            expect -re {[Ll]ogin:}
+            send "admin\r"
+            expect -re {[Pp]assword:}
+            send "admin\r"
+        }
+        -re {new password|[Cc]hange.*[Pp]assword} {
+            # First boot — set password to "admin"
+            send "admin\r"
+            expect -re {repeat|again|confirm|new password}
+            send "admin\r"
+        }
+        -re {agreement|license|\[Y\]} {
+            send "Y\r"
+            expect -re $prompt
+            return
+        }
+        -re $prompt { return }
+    }
+
+    # Handle license agreement or prompt after password change / successful login
+    expect {
+        -re {agreement|license|\[Y\]} {
+            send "Y\r"
+            expect -re $prompt
+        }
+        -re $prompt {}
+        timeout {
+            send "\r"
+            expect -re $prompt
+        }
+    }
 }
+
+do_login
 
 # Read config file and send each command
 set fp [open $config_file r]
@@ -379,13 +464,15 @@ while {[gets $fp line] >= 0} {
     send "$line\r"
     expect {
         -re $prompt {}
-        -re {invalid command|bad command|failure:} {
+        -re {expected end of command|invalid command|bad command|failure:|no such item|syntax error} {
             puts "WARNING: command may have failed: $line"
             expect -re $prompt
         }
         timeout {
             puts "timeout after: $line"
-            exit 1
+            # Try to recover by sending enter
+            send "\r"
+            expect -re $prompt
         }
     }
 }
@@ -399,15 +486,19 @@ close
 EXPECT_SCRIPT
 
     expect "$expect_script" "$CONFIGS_DIR/mikrotik-hotspot.rsc"
-    local rc=$?
+    local rc_hotspot=$?
+
+    expect "$expect_script" "$CONFIGS_DIR/mikrotik-logging.rsc"
+    local rc_logging=$?
+
     rm -f "$expect_script"
 
-    if [ $rc -eq 0 ]; then
-        log "Configuration applied"
+    if [ $rc_hotspot -eq 0 ] && [ $rc_logging -eq 0 ]; then
+        log "Configuration applied (hotspot + logging)"
     else
-        warn "Auto-config may have failed"
+        warn "Auto-config may have failed (hotspot=$rc_hotspot logging=$rc_logging)"
         info "Connect manually: socat -,rawer tcp:localhost:4444"
-        info "Then paste commands from: configs/mikrotik-hotspot.rsc"
+        info "Then paste commands from: configs/mikrotik-hotspot.rsc and configs/mikrotik-logging.rsc"
     fi
 }
 
@@ -576,6 +667,7 @@ main() {
     check_deps
     download_images
     build_radius
+    build_ingester
 
     echo ""
     log "Setup complete. Starting lab..."
@@ -583,6 +675,8 @@ main() {
 
     trap cleanup EXIT INT TERM
 
+    start_clickhouse
+    start_ingester
     start_radius
     start_mikrotik
     configure_mikrotik
@@ -597,6 +691,7 @@ main() {
     echo "  │  Mikrotik SSH:    ssh -p 2222 admin@localhost│"
     echo "  │  Mikrotik pass:   admin                     │"
     echo "  │  Mikrotik serial: nc localhost 4444         │"
+    echo "  │  ClickHouse UI:   http://localhost:8123/play │"
     echo "  │  Lubuntu: 'Try Lubuntu' -> open Firefox     │"
     echo "  │                                             │"
     echo "  │  Press Ctrl+C to stop everything            │"
