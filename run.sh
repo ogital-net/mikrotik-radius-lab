@@ -32,11 +32,14 @@ info() { echo -e "${CYAN}[i]${NC} $*"; }
 
 ACTION="run"
 GUEST_ARCH="auto"
+LAB="hotspot"
 
 for arg in "$@"; do
     case "$arg" in
         arm64|arm|aarch64) GUEST_ARCH="arm64" ;;
         x64|x86_64|x86|amd64) GUEST_ARCH="x64" ;;
+        --lab=hotspot)  LAB="hotspot" ;;
+        --lab=dhcp)     LAB="dhcp" ;;
         --stop|stop)    ACTION="stop" ;;
         --help|-h)      ACTION="help" ;;
         *) err "Unknown argument: $arg"; exit 1 ;;
@@ -55,7 +58,7 @@ fi
 # ─── CHR VM config ─────────────────────────────────────────────
 
 if [ "$GUEST_ARCH" = "arm64" ]; then
-    CHR_VERSION="7.20.8"
+    CHR_VERSION="7.21.4"
     CHR_QEMU_BIN="qemu-system-aarch64"
     CHR_IMG="$IMAGES_DIR/chr-${CHR_VERSION}-arm64.img"
     CHR_IMG_NAME="chr-${CHR_VERSION}-arm64.img"
@@ -68,7 +71,7 @@ if [ "$GUEST_ARCH" = "arm64" ]; then
     CHR_MEM=1024
     CHR_BOOT_DEFAULT=45
 else
-    CHR_VERSION="7.20.8"
+    CHR_VERSION="7.21.4"
     CHR_QEMU_BIN="qemu-system-x86_64"
     CHR_IMG="$IMAGES_DIR/chr-x86_64.img"
     CHR_IMG_NAME="chr-${CHR_VERSION}.img"
@@ -122,7 +125,8 @@ find_efi_vars_template() {
 }
 
 prepare_efi_vars() {
-    local vars_file="$IMAGES_DIR/efivars-mikrotik-arm64.fd"
+    local name="${1:-mikrotik}"
+    local vars_file="$IMAGES_DIR/efivars-${name}-arm64.fd"
     if [ ! -f "$vars_file" ]; then
         local efi_code efi_vars_src code_size
         efi_code="$(find_efi_code)"
@@ -137,6 +141,15 @@ prepare_efi_vars() {
         dd if=/dev/zero of="$vars_file" bs=1 count=0 seek="$code_size" 2>/dev/null
     fi
     echo "$vars_file"
+}
+
+prepare_chr_overlay() {
+    local name="$1"
+    local overlay="$IMAGES_DIR/chr-${name}-overlay.qcow2"
+    if [ ! -f "$overlay" ]; then
+        qemu-img create -f qcow2 -F raw -b "$CHR_IMG" "$overlay" >/dev/null
+    fi
+    echo "$overlay"
 }
 
 # ─── Dependency check ───────────────────────────────────────────
@@ -263,7 +276,8 @@ start_radius() {
     mkdir -p "$PID_DIR"
     log "Starting RADIUS server on 0.0.0.0:1812..."
 
-    RUST_LOG=info "$RADIUS_DIR/target/release/radius-server" &
+    RUST_LOG=info "$RADIUS_DIR/target/release/radius-server" \
+        > "$PID_DIR/radius.log" 2>&1 &
     echo $! > "$PID_DIR/radius.pid"
 
     sleep 1
@@ -325,6 +339,152 @@ start_mikrotik() {
     log "Mikrotik VM running (PID $(cat "$PID_DIR/mikrotik.pid"))"
 }
 
+start_chr_access() {
+    mkdir -p "$PID_DIR"
+    log "Starting CHR-ACCESS (${GUEST_ARCH})..."
+    local overlay
+    overlay="$(prepare_chr_overlay access)"
+
+    if [ "$GUEST_ARCH" = "arm64" ]; then
+        local efi_code efi_vars
+        efi_code="$(find_efi_code)"
+        efi_vars="$(prepare_efi_vars access)"
+
+        $CHR_QEMU_BIN \
+            -name chr-access \
+            -machine "$CHR_MACHINE" $CHR_ACCEL \
+            $CHR_CPU \
+            -smp "$CHR_SMP" \
+            -m "$CHR_MEM" \
+            -drive if=pflash,format=raw,readonly=on,unit=0,file="$efi_code" \
+            -drive if=pflash,format=raw,unit=1,file="$efi_vars" \
+            -drive file="$overlay",format=qcow2,if=none,id=disk0 \
+            -device nvme,drive=disk0,serial=access \
+            -netdev socket,id=up,listen=:22228 \
+            -device virtio-net-pci,netdev=up,mac=52:54:00:00:aa:01 \
+            -netdev socket,id=lineA,listen=:22221 \
+            -device virtio-net-pci,netdev=lineA,mac=52:54:00:00:aa:02 \
+            -netdev socket,id=lineB,listen=:22223 \
+            -device virtio-net-pci,netdev=lineB,mac=52:54:00:00:aa:03 \
+            -netdev user,id=wan,hostfwd=tcp::2223-:22 \
+            -device virtio-net-pci,netdev=wan,mac=52:54:00:00:aa:00 \
+            -vga none \
+            -serial tcp::4445,server,nowait \
+            -display none \
+            &
+    else
+        $CHR_QEMU_BIN \
+            -name chr-access \
+            -machine "$CHR_MACHINE" $CHR_ACCEL \
+            $CHR_CPU \
+            -smp "$CHR_SMP" \
+            -m "$CHR_MEM" \
+            -drive file="$overlay",format=qcow2,if=virtio \
+            -netdev socket,id=up,listen=:22228 \
+            -device virtio-net-pci,netdev=up,mac=52:54:00:00:aa:01 \
+            -netdev socket,id=lineA,listen=:22221 \
+            -device virtio-net-pci,netdev=lineA,mac=52:54:00:00:aa:02 \
+            -netdev socket,id=lineB,listen=:22223 \
+            -device virtio-net-pci,netdev=lineB,mac=52:54:00:00:aa:03 \
+            -netdev user,id=wan,hostfwd=tcp::2223-:22 \
+            -device virtio-net-pci,netdev=wan,mac=52:54:00:00:aa:00 \
+            -serial tcp::4445,server,nowait \
+            -display none \
+            &
+    fi
+
+    echo $! > "$PID_DIR/chr-access.pid"
+    log "CHR-ACCESS running (PID $(cat "$PID_DIR/chr-access.pid"))"
+}
+
+start_chr_core() {
+    mkdir -p "$PID_DIR"
+    log "Starting CHR-CORE (${GUEST_ARCH})..."
+    local overlay
+    overlay="$(prepare_chr_overlay core)"
+
+    if [ "$GUEST_ARCH" = "arm64" ]; then
+        local efi_code efi_vars
+        efi_code="$(find_efi_code)"
+        efi_vars="$(prepare_efi_vars core)"
+
+        $CHR_QEMU_BIN \
+            -name chr-core \
+            -machine "$CHR_MACHINE" $CHR_ACCEL \
+            $CHR_CPU \
+            -smp "$CHR_SMP" \
+            -m "$CHR_MEM" \
+            -drive if=pflash,format=raw,readonly=on,unit=0,file="$efi_code" \
+            -drive if=pflash,format=raw,unit=1,file="$efi_vars" \
+            -drive file="$overlay",format=qcow2,if=none,id=disk0 \
+            -device nvme,drive=disk0,serial=core \
+            -netdev socket,id=down,connect=127.0.0.1:22228 \
+            -device virtio-net-pci,netdev=down,mac=52:54:00:00:c0:01 \
+            -netdev user,id=wan,hostfwd=tcp::2222-:22,hostfwd=tcp::8291-:8291 \
+            -device virtio-net-pci,netdev=wan,mac=52:54:00:00:c0:02 \
+            -vga none \
+            -serial tcp::4444,server,nowait \
+            -display none \
+            &
+    else
+        $CHR_QEMU_BIN \
+            -name chr-core \
+            -machine "$CHR_MACHINE" $CHR_ACCEL \
+            $CHR_CPU \
+            -smp "$CHR_SMP" \
+            -m "$CHR_MEM" \
+            -drive file="$overlay",format=qcow2,if=virtio \
+            -netdev socket,id=down,connect=127.0.0.1:22228 \
+            -device virtio-net-pci,netdev=down,mac=52:54:00:00:c0:01 \
+            -netdev user,id=wan,hostfwd=tcp::2222-:22,hostfwd=tcp::8291-:8291 \
+            -device virtio-net-pci,netdev=wan,mac=52:54:00:00:c0:02 \
+            -serial tcp::4444,server,nowait \
+            -display none \
+            &
+    fi
+
+    echo $! > "$PID_DIR/chr-core.pid"
+    log "CHR-CORE running (PID $(cat "$PID_DIR/chr-core.pid"))"
+}
+
+start_vm_a() {
+    mkdir -p "$PID_DIR"
+    log "Starting VM-A (Lubuntu, line A → :22221)..."
+    $CLIENT_QEMU_BIN \
+        -name vm-a \
+        -machine q35 $CLIENT_ACCEL \
+        $CLIENT_CPU \
+        -smp 2 \
+        -m 2048 \
+        -cdrom "$IMAGES_DIR/client-x86_64.iso" \
+        -netdev socket,id=net0,connect=127.0.0.1:22221 \
+        -device virtio-net-pci,netdev=net0,mac=52:54:00:00:0a:01 \
+        -vga virtio \
+        -display cocoa \
+        &
+    echo $! > "$PID_DIR/vm-a.pid"
+    log "VM-A running (PID $(cat "$PID_DIR/vm-a.pid"))"
+}
+
+start_vm_b() {
+    mkdir -p "$PID_DIR"
+    log "Starting VM-B (Lubuntu, line B → :22223)..."
+    $CLIENT_QEMU_BIN \
+        -name vm-b \
+        -machine q35 $CLIENT_ACCEL \
+        $CLIENT_CPU \
+        -smp 2 \
+        -m 2048 \
+        -cdrom "$IMAGES_DIR/client-x86_64.iso" \
+        -netdev socket,id=net0,connect=127.0.0.1:22223 \
+        -device virtio-net-pci,netdev=net0,mac=52:54:00:00:0b:01 \
+        -vga virtio \
+        -display cocoa \
+        &
+    echo $! > "$PID_DIR/vm-b.pid"
+    log "VM-B running (PID $(cat "$PID_DIR/vm-b.pid"))"
+}
+
 # ─── Start Client VM ───────────────────────────────────────────
 
 start_client() {
@@ -351,20 +511,12 @@ start_client() {
 
 # ─── Configure Mikrotik via serial (expect) ───────────────────
 
-configure_mikrotik() {
-    local boot_wait="${MIKROTIK_BOOT_WAIT:-$CHR_BOOT_DEFAULT}"
-    log "Waiting ${boot_wait}s for RouterOS to boot..."
-    sleep "$boot_wait"
-
-    log "Configuring RouterOS via serial (expect)..."
-
-    # Write a self-contained expect script to a temp file to avoid heredoc escaping issues
-    local expect_script
-    expect_script="$(mktemp /tmp/mikrotik-config.XXXXXX.exp)"
-
+write_chr_expect_script() {
+    local expect_script="$1"
     cat > "$expect_script" << 'EXPECT_SCRIPT'
 set timeout 60
-set config_file [lindex $argv 0]
+set serial_port [lindex $argv 0]
+set config_file [lindex $argv 1]
 
 log_user 1
 
@@ -372,7 +524,7 @@ log_user 1
 # Use a loose pattern to handle ANSI escape codes on serial
 set prompt {> $}
 
-spawn socat - tcp:localhost:4444,connect-timeout=120
+spawn socat - tcp:localhost:$serial_port,connect-timeout=120
 
 # Wait for socat connection to establish
 sleep 2
@@ -484,22 +636,46 @@ expect -re $prompt
 puts "\nconfiguration applied successfully"
 close
 EXPECT_SCRIPT
+}
 
-    expect "$expect_script" "$CONFIGS_DIR/mikrotik-hotspot.rsc"
-    local rc_hotspot=$?
-
-    expect "$expect_script" "$CONFIGS_DIR/mikrotik-logging.rsc"
-    local rc_logging=$?
-
+apply_chr_config() {
+    local serial_port="$1"
+    local config_file="$2"
+    local label="${3:-$(basename "$config_file")}"
+    local expect_script
+    expect_script="$(mktemp /tmp/mikrotik-config.XXXXXX.exp)"
+    write_chr_expect_script "$expect_script"
+    expect "$expect_script" "$serial_port" "$config_file"
+    local rc=$?
     rm -f "$expect_script"
-
-    if [ $rc_hotspot -eq 0 ] && [ $rc_logging -eq 0 ]; then
-        log "Configuration applied (hotspot + logging)"
+    if [ $rc -eq 0 ]; then
+        log "Applied $label on serial :$serial_port"
     else
-        warn "Auto-config may have failed (hotspot=$rc_hotspot logging=$rc_logging)"
-        info "Connect manually: socat -,rawer tcp:localhost:4444"
-        info "Then paste commands from: configs/mikrotik-hotspot.rsc and configs/mikrotik-logging.rsc"
+        warn "Auto-config may have failed for $label (serial :$serial_port, rc=$rc)"
+        info "Connect manually: socat -,rawer tcp:localhost:$serial_port"
+        info "Then paste commands from: $config_file"
     fi
+    return $rc
+}
+
+configure_mikrotik() {
+    local boot_wait="${MIKROTIK_BOOT_WAIT:-$CHR_BOOT_DEFAULT}"
+    log "Waiting ${boot_wait}s for RouterOS to boot..."
+    sleep "$boot_wait"
+    log "Configuring RouterOS via serial (expect)..."
+    apply_chr_config 4444 "$CONFIGS_DIR/mikrotik-hotspot.rsc" "hotspot"
+    apply_chr_config 4444 "$CONFIGS_DIR/mikrotik-logging.rsc" "logging"
+}
+
+configure_dhcp_lab() {
+    local boot_wait="${MIKROTIK_BOOT_WAIT:-$CHR_BOOT_DEFAULT}"
+    log "Waiting ${boot_wait}s for both CHRs to boot..."
+    sleep "$boot_wait"
+    log "Configuring CHR-ACCESS (serial :4445)..."
+    apply_chr_config 4445 "$CONFIGS_DIR/mikrotik-access.rsc" "access"
+    log "Configuring CHR-CORE (serial :4444)..."
+    apply_chr_config 4444 "$CONFIGS_DIR/mikrotik-core.rsc" "core"
+    apply_chr_config 4444 "$CONFIGS_DIR/mikrotik-logging.rsc" "logging"
 }
 
 # ─── Upload custom HotSpot HTML to Mikrotik via SCP ──────────
@@ -604,17 +780,20 @@ show_help() {
   Captive Portal Lab
   ==================
 
-  Usage: ./run.sh [arm64|x64] [OPTIONS]
+  Usage: ./run.sh [arm64|x64] [--lab=hotspot|dhcp] [OPTIONS]
 
   On Apple Silicon, defaults to ARM64 CHR (native).
   On x86_64 hosts, defaults to x86_64 CHR (native).
   Use "x64" to force x86_64 emulation on any host.
 
   Options:
-    arm64    Use ARM64 CHR (TCG, NVMe disk)
-    x64      Use x86_64 CHR (HVF on x86, TCG on ARM)
-    --stop   Stop all running components
-    --help   Show this help
+    arm64           Use ARM64 CHR (TCG, NVMe disk)
+    x64             Use x86_64 CHR (HVF on x86, TCG on ARM)
+    --lab=hotspot   HotSpot lab (default): one CHR + one Lubuntu, captive portal
+    --lab=dhcp      Option 82 lab: CHR-ACCESS + CHR-CORE + two Lubuntus,
+                    DHCP-driven RADIUS subscriber identification
+    --stop          Stop all running components
+    --help          Show this help
 
   Components:
     Mikrotik CHR    Router with HotSpot captive portal
@@ -653,6 +832,7 @@ main() {
         echo -e "${CYAN}  ║       Captive Portal Lab (x64)        ║${NC}"
     fi
     echo -e "${CYAN}  ╚═══════════════════════════════════════╝${NC}"
+    info "lab=$LAB"
     echo ""
 
     if [ "$GUEST_ARCH" = "arm64" ]; then
@@ -675,6 +855,14 @@ main() {
 
     trap cleanup EXIT INT TERM
 
+    case "$LAB" in
+        hotspot) main_hotspot ;;
+        dhcp)    main_dhcp ;;
+        *) err "Unknown LAB=$LAB"; exit 1 ;;
+    esac
+}
+
+main_hotspot() {
     start_clickhouse
     start_ingester
     start_radius
@@ -698,8 +886,45 @@ main() {
     echo "  └─────────────────────────────────────────────┘"
     echo ""
 
-    # Wait for client VM to exit
     wait "$(cat "$PID_DIR/client.pid")" 2>/dev/null || true
+}
+
+main_dhcp() {
+    start_clickhouse
+    start_ingester
+    start_radius
+
+    start_chr_access
+    sleep 2
+    start_chr_core
+    start_vm_a
+    start_vm_b
+
+    configure_dhcp_lab
+
+    echo ""
+    echo "  ┌────────────────────────────────────────────────┐"
+    echo "  │  DHCP / Option 82 lab is running!              │"
+    echo "  │                                                │"
+    echo "  │  CHR-CORE   SSH:    ssh -p 2222 admin@localhost│"
+    echo "  │  CHR-ACCESS SSH:    ssh -p 2223 admin@localhost│"
+    echo "  │  CHR-CORE   serial: nc localhost 4444          │"
+    echo "  │  CHR-ACCESS serial: nc localhost 4445          │"
+    echo "  │  ClickHouse UI:     http://localhost:8123/play │"
+    echo "  │  RADIUS log:        watch radius-server stdout │"
+    echo "  │                                                │"
+    echo "  │  VM-A is line A (acc01:eth2 → 192.168.50.10)   │"
+    echo "  │  VM-B is line B (acc01:eth3 → pool 100-200)    │"
+    echo "  │                                                │"
+    echo "  │  T3 swap test: stop both VMs, restart with     │"
+    echo "  │  --vm-a-port=22223 / --vm-b-port=22221         │"
+    echo "  │  (or just edit the start_vm_* socket ports).   │"
+    echo "  │                                                │"
+    echo "  │  Press Ctrl+C to stop everything               │"
+    echo "  └────────────────────────────────────────────────┘"
+    echo ""
+
+    wait "$(cat "$PID_DIR/vm-a.pid")" 2>/dev/null || true
 }
 
 case "$ACTION" in
