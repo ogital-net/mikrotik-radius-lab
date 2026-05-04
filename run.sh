@@ -33,6 +33,7 @@ info() { echo -e "${CYAN}[i]${NC} $*"; }
 ACTION="run"
 GUEST_ARCH="auto"
 LAB="hotspot"
+SWAP_LINES=0
 
 for arg in "$@"; do
     case "$arg" in
@@ -40,11 +41,19 @@ for arg in "$@"; do
         x64|x86_64|x86|amd64) GUEST_ARCH="x64" ;;
         --lab=hotspot)  LAB="hotspot" ;;
         --lab=dhcp)     LAB="dhcp" ;;
+        --swap)         SWAP_LINES=1 ;;
         --stop|stop)    ACTION="stop" ;;
         --help|-h)      ACTION="help" ;;
         *) err "Unknown argument: $arg"; exit 1 ;;
     esac
 done
+
+VM_A_PORT=22221
+VM_B_PORT=22223
+if [ "$SWAP_LINES" = "1" ]; then
+    VM_A_PORT=22223
+    VM_B_PORT=22221
+fi
 
 # Auto-detect: use native architecture for CHR
 if [ "$GUEST_ARCH" = "auto" ]; then
@@ -449,7 +458,7 @@ start_chr_core() {
 
 start_vm_a() {
     mkdir -p "$PID_DIR"
-    log "Starting VM-A (Lubuntu, line A → :22221)..."
+    log "Starting VM-A (Lubuntu, → :$VM_A_PORT)..."
     $CLIENT_QEMU_BIN \
         -name vm-a \
         -machine q35 $CLIENT_ACCEL \
@@ -457,7 +466,7 @@ start_vm_a() {
         -smp 2 \
         -m 2048 \
         -cdrom "$IMAGES_DIR/client-x86_64.iso" \
-        -netdev socket,id=net0,connect=127.0.0.1:22221 \
+        -netdev socket,id=net0,connect=127.0.0.1:$VM_A_PORT \
         -device virtio-net-pci,netdev=net0,mac=52:54:00:00:0a:01 \
         -vga virtio \
         -display cocoa \
@@ -468,7 +477,7 @@ start_vm_a() {
 
 start_vm_b() {
     mkdir -p "$PID_DIR"
-    log "Starting VM-B (Lubuntu, line B → :22223)..."
+    log "Starting VM-B (Lubuntu, → :$VM_B_PORT)..."
     $CLIENT_QEMU_BIN \
         -name vm-b \
         -machine q35 $CLIENT_ACCEL \
@@ -476,7 +485,7 @@ start_vm_b() {
         -smp 2 \
         -m 2048 \
         -cdrom "$IMAGES_DIR/client-x86_64.iso" \
-        -netdev socket,id=net0,connect=127.0.0.1:22223 \
+        -netdev socket,id=net0,connect=127.0.0.1:$VM_B_PORT \
         -device virtio-net-pci,netdev=net0,mac=52:54:00:00:0b:01 \
         -vga virtio \
         -display cocoa \
@@ -792,6 +801,9 @@ show_help() {
     --lab=hotspot   HotSpot lab (default): one CHR + one Lubuntu, captive portal
     --lab=dhcp      Option 82 lab: CHR-ACCESS + CHR-CORE + two Lubuntus,
                     DHCP-driven RADIUS subscriber identification
+    --swap          (dhcp lab) Swap VM-A and VM-B socket ports — VM-A
+                    on line B (:22223) and VM-B on line A (:22221).
+                    Used to verify policy follows the wire (T3).
     --stop          Stop all running components
     --help          Show this help
 
@@ -913,12 +925,16 @@ main_dhcp() {
     echo "  │  ClickHouse UI:     http://localhost:8123/play │"
     echo "  │  RADIUS log:        watch radius-server stdout │"
     echo "  │                                                │"
-    echo "  │  VM-A is line A (acc01:eth2 → 192.168.50.10)   │"
-    echo "  │  VM-B is line B (acc01:eth3 → pool 100-200)    │"
-    echo "  │                                                │"
-    echo "  │  T3 swap test: stop both VMs, restart with     │"
-    echo "  │  --vm-a-port=22223 / --vm-b-port=22221         │"
-    echo "  │  (or just edit the start_vm_* socket ports).   │"
+    if [ "$SWAP_LINES" = "1" ]; then
+        echo "  │  --swap ACTIVE: VM-A on :22223, VM-B on :22221 │"
+        echo "  │  T3: policies should follow the wire, not VMs. │"
+    else
+        echo "  │  VM-A on line A (ether2 → 192.168.50.10)       │"
+        echo "  │  VM-B on line B (ether3 → pool 100-200)        │"
+        echo "  │                                                │"
+        echo "  │  T3 swap test: ./run.sh --stop, then            │"
+        echo "  │  ./run.sh --lab=dhcp --swap                    │"
+    fi
     echo "  │                                                │"
     echo "  │  Press Ctrl+C to stop everything               │"
     echo "  └────────────────────────────────────────────────┘"
