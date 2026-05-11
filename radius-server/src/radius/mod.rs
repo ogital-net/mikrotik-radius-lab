@@ -1,22 +1,16 @@
 use crate::audit;
 use log::info;
-use radius::core::code::Code;
-use radius::core::request::Request;
-use radius::dict::rfc2865;
-use radius::server::{RequestHandler, SecretProvider, SecretProviderError};
+use radius_tokio::dict::generated::rfc::attrs;
+use radius_tokio::server::{Handler, HandlerResult, Request};
+use radius_tokio::typed::{Attr, VsaAttr, WText, WireType};
+use radius_tokio::Code;
 use sqlx::SqlitePool;
-use std::io;
-use std::net::SocketAddr;
-use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
 pub mod accounting;
 pub mod dhcp;
 pub mod hotspot;
-pub mod response;
 pub mod spike;
-
-pub const SECRET: &[u8] = b"secret";
 
 #[derive(Debug, Clone, Copy)]
 pub enum AccessKind {
@@ -24,18 +18,43 @@ pub enum AccessKind {
     Dhcp,
 }
 
-pub fn classify(req: &radius::core::packet::Packet) -> AccessKind {
-    let user_name = rfc2865::lookup_user_name(req)
-        .and_then(|r| r.ok())
-        .unwrap_or_default();
+pub fn classify(request: &Request<'_>) -> AccessKind {
+    let user_name = first_text(request, attrs::USER_NAME).unwrap_or_default();
     if is_mac_string(&user_name) {
         return AccessKind::Dhcp;
     }
-    if rfc2865::lookup_user_password(req).is_some() {
+    if request.first_raw(2).ok().flatten().is_some() {
         AccessKind::Hotspot
     } else {
         AccessKind::Dhcp
     }
+}
+
+pub fn first<'a, T: WireType>(request: &Request<'a>, attr: Attr<T>) -> Option<T::View<'a>> {
+    for slot in request.attributes_iter() {
+        let raw = slot.ok()?;
+        if let Some(v) = raw.get(attr) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+pub fn first_vsa<'a, T: WireType>(
+    request: &Request<'a>,
+    attr: VsaAttr<T>,
+) -> Option<T::View<'a>> {
+    for slot in request.attributes_iter() {
+        let raw = slot.ok()?;
+        if let Some(v) = raw.get_vsa(attr) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+pub fn first_text(request: &Request<'_>, attr: Attr<WText>) -> Option<String> {
+    first(request, attr).map(str::to_owned)
 }
 
 fn is_mac_string(s: &str) -> bool {
@@ -63,40 +82,29 @@ fn is_mac_string(s: &str) -> bool {
 }
 
 #[derive(Clone)]
-pub struct Handler {
+pub struct AppHandler {
     pub db: SqlitePool,
     pub audit_tx: mpsc::Sender<audit::SessionEvent>,
 }
 
-impl RequestHandler<(), io::Error> for Handler {
-    async fn handle_radius_request(
-        &self,
-        conn: &UdpSocket,
-        req: &Request,
-    ) -> Result<(), io::Error> {
-        let req_packet = req.packet();
-        info!("RADIUS {:?} from {}", req_packet.code(), req.remote_addr());
+impl Handler for AppHandler {
+    async fn handle(&self, request: Request<'_>) -> HandlerResult {
+        info!("RADIUS {:?} from {}", request.code(), request.src());
 
-        match req_packet.code() {
-            Code::AccessRequest => match classify(req_packet) {
-                AccessKind::Hotspot => hotspot::handle(conn, req, &self.db).await,
-                AccessKind::Dhcp => dhcp::handle(conn, req, &self.db).await,
+        match request.code() {
+            Code::ACCESS_REQUEST => match classify(&request) {
+                AccessKind::Hotspot => hotspot::handle(&request, &self.db).await,
+                AccessKind::Dhcp => dhcp::handle(&request, &self.db).await,
             },
-            Code::AccountingRequest => {
-                accounting::handle(conn, req, &self.db, &self.audit_tx).await
+            Code::ACCOUNTING_REQUEST => {
+                accounting::handle(&request, &self.db, &self.audit_tx).await
             }
             other => {
                 info!("ignoring unsupported RADIUS code {:?}", other);
-                Ok(())
+                HandlerResult::Drop
             }
         }
     }
 }
 
-pub struct StaticSecret;
-
-impl SecretProvider for StaticSecret {
-    fn fetch_secret(&self, _remote_addr: SocketAddr) -> Result<Vec<u8>, SecretProviderError> {
-        Ok(SECRET.to_vec())
-    }
-}
+pub use radius_tokio::dict::generated::mikrotik::attrs as mikrotik_attrs;

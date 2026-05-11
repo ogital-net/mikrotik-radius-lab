@@ -1,44 +1,39 @@
-use super::response;
+use super::{first_text, mikrotik_attrs};
 use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use log::info;
-use radius::{
-    core::{code::Code, request::Request},
-    dict::{mikrotik, rfc2865},
-};
+use radius_tokio::auth::pap;
+use radius_tokio::dict::generated::rfc::attrs;
+use radius_tokio::server::{HandlerResult, Request};
+use radius_tokio::Code;
 use sqlx::SqlitePool;
-use std::io;
-use tokio::net::UdpSocket;
 
-pub async fn handle(conn: &UdpSocket, req: &Request, db: &SqlitePool) -> Result<(), io::Error> {
-    let req_packet = req.packet();
-
-    let user_name = match rfc2865::lookup_user_name(req_packet).and_then(|r| r.ok()) {
+pub async fn handle(request: &Request<'_>, db: &SqlitePool) -> HandlerResult {
+    let user_name = match first_text(request, attrs::USER_NAME) {
         Some(s) => s,
         None => {
             info!(
                 "hotspot Access-Request without User-Name from {}; rejecting",
-                req.remote_addr()
+                request.src()
             );
-            let bytes = response::encode(req_packet, Code::AccessReject);
-            conn.send_to(&bytes, req.remote_addr()).await?;
-            return Ok(());
+            return HandlerResult::Reply(request.reply(Code::ACCESS_REJECT));
         }
     };
-    let user_password = match rfc2865::lookup_user_password(req_packet).and_then(|r| r.ok()) {
-        Some(bytes) => match String::from_utf8(bytes) {
-            Ok(s) => s,
+
+    let user_password = match pap::decrypt_user_password(request) {
+        Ok(Some(bytes)) => match std::str::from_utf8(bytes.as_bytes()) {
+            Ok(s) => s.to_owned(),
             Err(_) => {
                 info!("hotspot Access-Request with non-UTF8 User-Password; rejecting");
-                let bytes = response::encode(req_packet, Code::AccessReject);
-                conn.send_to(&bytes, req.remote_addr()).await?;
-                return Ok(());
+                return HandlerResult::Reply(request.reply(Code::ACCESS_REJECT));
             }
         },
-        None => {
+        Ok(None) => {
             info!("hotspot Access-Request without User-Password; rejecting");
-            let bytes = response::encode(req_packet, Code::AccessReject);
-            conn.send_to(&bytes, req.remote_addr()).await?;
-            return Ok(());
+            return HandlerResult::Reply(request.reply(Code::ACCESS_REJECT));
+        }
+        Err(_) => {
+            info!("hotspot Access-Request with malformed User-Password; rejecting");
+            return HandlerResult::Reply(request.reply(Code::ACCESS_REJECT));
         }
     };
 
@@ -54,28 +49,26 @@ pub async fn handle(conn: &UdpSocket, req: &Request, db: &SqlitePool) -> Result<
                         .verify_password(user_password.as_bytes(), &h)
                         .is_ok()
                     {
-                        Code::AccessAccept
+                        Code::ACCESS_ACCEPT
                     } else {
-                        Code::AccessReject
+                        Code::ACCESS_REJECT
                     }
                 }
-                Err(_) => Code::AccessReject,
+                Err(_) => Code::ACCESS_REJECT,
             },
-            _ => Code::AccessReject,
+            _ => Code::ACCESS_REJECT,
         };
 
     info!(
         "RADIUS => {:?} for user '{}' to {}",
         code,
         user_name,
-        req.remote_addr()
+        request.src()
     );
 
-    let mut resp = response::make(req_packet, code);
-    if code == Code::AccessAccept {
-        mikrotik::add_mikrotik_rate_limit(&mut resp, "10M/10M");
+    let mut reply = request.reply(code);
+    if code == Code::ACCESS_ACCEPT {
+        let _ = reply.add_vsa(mikrotik_attrs::MIKROTIK_RATE_LIMIT, "10M/10M");
     }
-    let bytes = response::finalize(resp, req_packet.authenticator());
-    conn.send_to(&bytes, req.remote_addr()).await?;
-    Ok(())
+    HandlerResult::Reply(reply)
 }

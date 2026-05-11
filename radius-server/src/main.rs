@@ -4,14 +4,16 @@ mod radius;
 mod subscribers;
 mod web;
 
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::process;
+use std::sync::Arc;
 
 use clickhouse::Client;
 use log::{info, warn};
+use radius_tokio::server::{Client as RadiusClient, IpCidr, Server, StaticClients};
 use tokio::signal;
 
-use ::radius::server::Server;
-
+const SECRET: &[u8] = b"secret";
 const WEB_PORT: u16 = 8080;
 const RADIUS_AUTH_PORT: u16 = 1812;
 const RADIUS_ACCT_PORT: u16 = 1813;
@@ -47,28 +49,31 @@ async fn main() {
         axum::serve(listener, app).await.unwrap();
     });
 
-    let handler = radius::Handler {
+    let handler = radius::AppHandler {
         db: pool.clone(),
         audit_tx,
     };
 
-    let mut auth_server = Server::listen(
-        "0.0.0.0",
-        RADIUS_AUTH_PORT,
-        handler.clone(),
-        radius::StaticSecret,
-    )
-    .await
-    .unwrap();
-    auth_server.set_buffer_size(1500);
-    auth_server.set_skip_authenticity_validation(false);
+    let shared = Arc::new(RadiusClient::new(SECRET));
+    let clients = StaticClients::builder()
+        .add(
+            IpCidr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0).unwrap(),
+            Arc::clone(&shared),
+        )
+        .add(
+            IpCidr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0).unwrap(),
+            shared,
+        )
+        .build();
 
-    let mut acct_server =
-        Server::listen("0.0.0.0", RADIUS_ACCT_PORT, handler, radius::StaticSecret)
-            .await
-            .unwrap();
-    acct_server.set_buffer_size(1500);
-    acct_server.set_skip_authenticity_validation(false);
+    let server = Server::builder()
+        .clients(clients)
+        .handler(handler)
+        .listen_udp(format!("0.0.0.0:{}", RADIUS_AUTH_PORT).parse().unwrap())
+        .listen_udp(format!("0.0.0.0:{}", RADIUS_ACCT_PORT).parse().unwrap())
+        .build()
+        .unwrap();
+    let shutdown = server.shutdown_handle();
 
     info!("RADIUS auth listening on 0.0.0.0:{}", RADIUS_AUTH_PORT);
     info!(
@@ -76,35 +81,13 @@ async fn main() {
         RADIUS_ACCT_PORT
     );
 
-    let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
-    let shutdown_signal = shutdown_tx.clone();
     tokio::spawn(async move {
         let _ = signal::ctrl_c().await;
-        let _ = shutdown_signal.send(());
+        shutdown.shutdown();
     });
 
-    let mut auth_shutdown = shutdown_tx.subscribe();
-    let mut acct_shutdown = shutdown_tx.subscribe();
-    let auth_handle = tokio::spawn(async move {
-        auth_server
-            .run(async move {
-                let _ = auth_shutdown.recv().await;
-            })
-            .await
-    });
-    let acct_handle = tokio::spawn(async move {
-        acct_server
-            .run(async move {
-                let _ = acct_shutdown.recv().await;
-            })
-            .await
-    });
-
-    let (auth_result, acct_result) = tokio::join!(auth_handle, acct_handle);
-    info!(
-        "RADIUS shutdown: auth={:?} acct={:?}",
-        auth_result, acct_result
-    );
+    let radius_result = server.run().await;
+    info!("RADIUS shutdown: {:?}", radius_result);
 
     web_handle.abort();
 
@@ -113,9 +96,7 @@ async fn main() {
         Err(_) => warn!("audit drain timed out; some events may be lost"),
     }
 
-    let auth_failed = matches!(&auth_result, Ok(Err(_)) | Err(_));
-    let acct_failed = matches!(&acct_result, Ok(Err(_)) | Err(_));
-    if auth_failed || acct_failed {
+    if radius_result.is_err() {
         process::exit(1);
     }
 }

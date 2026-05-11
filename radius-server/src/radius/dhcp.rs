@@ -1,16 +1,13 @@
-use super::{response, spike};
+use super::{first_text, first_vsa, mikrotik_attrs, spike};
 use crate::subscribers::{self, Addressing, Authorization};
 use log::{info, warn};
-use radius::core::code::Code;
-use radius::core::packet::Packet;
-use radius::core::request::Request;
-use radius::dict::{mikrotik, rfc2865, rfc2869};
+use radius_tokio::dict::generated::rfc::attrs;
+use radius_tokio::server::{HandlerResult, Request};
+use radius_tokio::{Code, Reply};
 use sqlx::SqlitePool;
 use std::collections::HashMap;
-use std::io;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use tokio::net::UdpSocket;
 
 const TRANSACTION_TTL: Duration = Duration::from_secs(60);
 
@@ -44,33 +41,22 @@ fn recall_transaction(mac: &str) -> Option<String> {
     })
 }
 
-const HEADER_LEN: usize = 20;
-const VENDOR_SPECIFIC: u8 = 26;
-const ATTR_CALLED_STATION_ID: u8 = 30;
-const ATTR_NAS_PORT_ID: u8 = 87;
 const ATTR_DHCP_AGENT_CIRCUIT_ID: u8 = 82;
 const VENDOR_MIKROTIK: u32 = 14988;
-const VENDOR_DSL_FORUM: u32 = 3561;
-const DSL_FORUM_AGENT_CIRCUIT_ID: u8 = 1;
-const DSL_FORUM_AGENT_REMOTE_ID: u8 = 2;
 const ACCT_INTERIM_INTERVAL_SECS: u32 = 300;
 
-pub async fn handle(conn: &UdpSocket, req: &Request, db: &SqlitePool) -> Result<(), io::Error> {
-    let req_packet = req.packet();
+pub async fn handle(request: &Request<'_>, db: &SqlitePool) -> HandlerResult {
+    spike::dump("dhcp Access-Request", request);
 
-    spike::dump("dhcp Access-Request", req_packet);
+    let mac = first_text(request, attrs::USER_NAME).unwrap_or_default();
 
-    let mac = rfc2865::lookup_user_name(req_packet)
-        .and_then(|r| r.ok())
-        .unwrap_or_default();
-
-    let circuit_id = match extract_circuit_id(req_packet) {
+    let circuit_id = match extract_circuit_id(request) {
         Some(c) => c,
         None => match recall_transaction(&mac) {
             Some(c) => {
                 info!(
                     "dhcp Access-Request from {} has no Circuit-Id; recovering from in-flight transaction for mac='{}' → circuit='{}'",
-                    req.remote_addr(),
+                    request.src(),
                     mac,
                     c
                 );
@@ -79,12 +65,10 @@ pub async fn handle(conn: &UdpSocket, req: &Request, db: &SqlitePool) -> Result<
             None => {
                 warn!(
                     "dhcp Access-Request from {} carries no recognizable Circuit-Id and no cached transaction for mac='{}' — rejecting",
-                    req.remote_addr(),
+                    request.src(),
                     mac
                 );
-                let bytes = response::encode(req_packet, Code::AccessReject);
-                conn.send_to(&bytes, req.remote_addr()).await?;
-                return Ok(());
+                return HandlerResult::Reply(request.reply(Code::ACCESS_REJECT));
             }
         },
     };
@@ -92,7 +76,7 @@ pub async fn handle(conn: &UdpSocket, req: &Request, db: &SqlitePool) -> Result<
     info!("dhcp lookup circuit_id='{}'", circuit_id);
     let authz = subscribers::authorize(db, &circuit_id).await;
 
-    let bytes = match authz {
+    let reply = match authz {
         Authorization::Accept {
             addressing,
             rate_limit,
@@ -104,14 +88,14 @@ pub async fn handle(conn: &UdpSocket, req: &Request, db: &SqlitePool) -> Result<
                 circuit_id, plan, addressing
             );
             remember_transaction(&mac, &circuit_id);
-            let mut resp = response::make(req_packet, Code::AccessAccept);
-            apply_addressing(&mut resp, &addressing);
+            let mut reply = request.reply(Code::ACCESS_ACCEPT);
+            apply_addressing(&mut reply, &addressing);
             if let Some(rl) = rate_limit.as_deref() {
-                mikrotik::add_mikrotik_rate_limit(&mut resp, rl);
+                let _ = reply.add_vsa(mikrotik_attrs::MIKROTIK_RATE_LIMIT, rl);
             }
-            rfc2865::add_session_timeout(&mut resp, session_timeout);
-            rfc2869::add_acct_interim_interval(&mut resp, ACCT_INTERIM_INTERVAL_SECS);
-            response::finalize(resp, req_packet.authenticator())
+            let _ = reply.add(attrs::SESSION_TIMEOUT, session_timeout);
+            let _ = reply.add(attrs::ACCT_INTERIM_INTERVAL, ACCT_INTERIM_INTERVAL_SECS);
+            reply
         }
         Authorization::WalledGarden {
             pool,
@@ -123,107 +107,62 @@ pub async fn handle(conn: &UdpSocket, req: &Request, db: &SqlitePool) -> Result<
                 circuit_id, plan, pool
             );
             remember_transaction(&mac, &circuit_id);
-            let mut resp = response::make(req_packet, Code::AccessAccept);
-            rfc2869::add_framed_pool(&mut resp, &pool);
-            rfc2865::add_session_timeout(&mut resp, session_timeout);
-            rfc2869::add_acct_interim_interval(&mut resp, ACCT_INTERIM_INTERVAL_SECS);
-            response::finalize(resp, req_packet.authenticator())
+            let mut reply = request.reply(Code::ACCESS_ACCEPT);
+            let _ = reply.add(attrs::FRAMED_POOL, pool.as_str());
+            let _ = reply.add(attrs::SESSION_TIMEOUT, session_timeout);
+            let _ = reply.add(attrs::ACCT_INTERIM_INTERVAL, ACCT_INTERIM_INTERVAL_SECS);
+            reply
         }
         Authorization::Reject(reason) => {
             warn!(
                 "dhcp REJECT circuit_id='{}' reason={:?}",
                 circuit_id, reason
             );
-            response::encode(req_packet, Code::AccessReject)
+            request.reply(Code::ACCESS_REJECT)
         }
     };
 
-    conn.send_to(&bytes, req.remote_addr()).await?;
-    Ok(())
+    HandlerResult::Reply(reply)
 }
 
-fn apply_addressing(resp: &mut Packet, addressing: &Addressing) {
+fn apply_addressing(reply: &mut Reply, addressing: &Addressing) {
     match addressing {
-        Addressing::FixedIp(ip) => rfc2865::add_framed_ip_address(resp, ip),
-        Addressing::Pool(pool) => rfc2869::add_framed_pool(resp, pool),
+        Addressing::FixedIp(ip) => {
+            let _ = reply.add(attrs::FRAMED_IP_ADDRESS, *ip);
+        }
+        Addressing::Pool(pool) => {
+            let _ = reply.add(attrs::FRAMED_POOL, pool.as_str());
+        }
     }
 }
 
-fn extract_circuit_id(req_packet: &Packet) -> Option<String> {
-    let bytes = req_packet.encode().ok()?;
-    if bytes.len() <= HEADER_LEN {
-        return None;
+fn extract_circuit_id(request: &Request<'_>) -> Option<String> {
+    if let Some(bytes) = first_vsa(request, attrs::ADSL_AGENT_CIRCUIT_ID) {
+        if let Ok(s) = std::str::from_utf8(bytes) {
+            return Some(s.to_string());
+        }
     }
-
-    if let Some(s) = scan_vsa_string(&bytes, VENDOR_DSL_FORUM, DSL_FORUM_AGENT_CIRCUIT_ID) {
+    if let Some(bytes) = first_vsa(request, attrs::ADSL_AGENT_REMOTE_ID) {
+        if let Ok(s) = std::str::from_utf8(bytes) {
+            return Some(s.to_string());
+        }
+    }
+    if let Some(s) = scan_attribute_82(request) {
         return Some(s);
     }
-    if let Some(s) = scan_vsa_string(&bytes, VENDOR_DSL_FORUM, DSL_FORUM_AGENT_REMOTE_ID) {
-        return Some(s);
-    }
-    if let Some(s) =
-        scan_attribute(&bytes, ATTR_DHCP_AGENT_CIRCUIT_ID).and_then(parse_option82_circuit_id)
-    {
-        return Some(s);
-    }
-    if let Some(s) = scan_mikrotik_vsa_for_circuit(&bytes) {
+    if let Some(s) = scan_mikrotik_vsa_for_circuit(request) {
         return Some(s);
     }
     None
 }
 
-fn scan_vsa_string(bytes: &[u8], target_vendor: u32, target_sub_type: u8) -> Option<String> {
-    let mut i = HEADER_LEN;
-    while i + 2 <= bytes.len() {
-        let typ = bytes[i];
-        let len = bytes[i + 1] as usize;
-        if len < 2 || i + len > bytes.len() {
-            return None;
-        }
-        if typ == VENDOR_SPECIFIC && len >= 6 {
-            let value = &bytes[i + 2..i + len];
-            let vendor_id = u32::from_be_bytes([value[0], value[1], value[2], value[3]]);
-            if vendor_id == target_vendor {
-                let mut j = 4;
-                while j + 2 <= value.len() {
-                    let sub_typ = value[j];
-                    let sub_len = value[j + 1] as usize;
-                    if sub_len < 2 || j + sub_len > value.len() {
-                        break;
-                    }
-                    if sub_typ == target_sub_type {
-                        let raw = &value[j + 2..j + sub_len];
-                        if let Ok(s) = std::str::from_utf8(raw) {
-                            return Some(s.to_string());
-                        }
-                    }
-                    j += sub_len;
-                }
-            }
-        }
-        i += len;
-    }
-    None
+fn scan_attribute_82(request: &Request<'_>) -> Option<String> {
+    let raw = request.first_raw(ATTR_DHCP_AGENT_CIRCUIT_ID).ok().flatten()?;
+    parse_option82_circuit_id(raw.value())
 }
 
-fn scan_attribute(bytes: &[u8], target: u8) -> Option<Vec<u8>> {
-    let mut i = HEADER_LEN;
-    while i + 2 <= bytes.len() {
-        let typ = bytes[i];
-        let len = bytes[i + 1] as usize;
-        if len < 2 || i + len > bytes.len() {
-            return None;
-        }
-        if typ == target {
-            return Some(bytes[i + 2..i + len].to_vec());
-        }
-        i += len;
-    }
-    None
-}
-
-fn parse_option82_circuit_id(value: Vec<u8>) -> Option<String> {
-    if let Ok(s) = std::str::from_utf8(&value) {
+fn parse_option82_circuit_id(value: &[u8]) -> Option<String> {
+    if let Ok(s) = std::str::from_utf8(value) {
         if !s.is_empty() && s.chars().all(|c| !c.is_control()) {
             return Some(s.to_string());
         }
@@ -245,36 +184,35 @@ fn parse_option82_circuit_id(value: Vec<u8>) -> Option<String> {
     None
 }
 
-fn scan_mikrotik_vsa_for_circuit(bytes: &[u8]) -> Option<String> {
-    let mut i = HEADER_LEN;
-    while i + 2 <= bytes.len() {
-        let typ = bytes[i];
-        let len = bytes[i + 1] as usize;
-        if len < 2 || i + len > bytes.len() {
-            return None;
+fn scan_mikrotik_vsa_for_circuit(request: &Request<'_>) -> Option<String> {
+    for slot in request.attributes_iter() {
+        let raw = slot.ok()?;
+        if raw.attribute_type() != 26 {
+            continue;
         }
-        if typ == VENDOR_SPECIFIC && len >= 6 {
-            let value = &bytes[i + 2..i + len];
-            let vendor_id = u32::from_be_bytes([value[0], value[1], value[2], value[3]]);
-            if vendor_id == VENDOR_MIKROTIK {
-                let mut j = 4;
-                while j + 2 <= value.len() {
-                    let sub_len = value[j + 1] as usize;
-                    if sub_len < 2 || j + sub_len > value.len() {
-                        break;
-                    }
-                    let sub_value = &value[j + 2..j + sub_len];
-                    if let Ok(s) = std::str::from_utf8(sub_value) {
-                        let lower = s.to_ascii_lowercase();
-                        if lower.contains("circuit") || lower.starts_with("acc") {
-                            return Some(s.to_string());
-                        }
-                    }
-                    j += sub_len;
+        let value = raw.value();
+        if value.len() < 6 {
+            continue;
+        }
+        let vendor_id = u32::from_be_bytes([value[0], value[1], value[2], value[3]]);
+        if vendor_id != VENDOR_MIKROTIK {
+            continue;
+        }
+        let mut j = 4;
+        while j + 2 <= value.len() {
+            let sub_len = value[j + 1] as usize;
+            if sub_len < 2 || j + sub_len > value.len() {
+                break;
+            }
+            let sub_value = &value[j + 2..j + sub_len];
+            if let Ok(s) = std::str::from_utf8(sub_value) {
+                let lower = s.to_ascii_lowercase();
+                if lower.contains("circuit") || lower.starts_with("acc") {
+                    return Some(s.to_string());
                 }
             }
+            j += sub_len;
         }
-        i += len;
     }
     None
 }

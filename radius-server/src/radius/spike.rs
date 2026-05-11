@@ -1,45 +1,31 @@
 use log::info;
-use radius::core::packet::Packet;
+use radius_tokio::server::Request;
 
-const HEADER_LEN: usize = 20;
 const VENDOR_SPECIFIC: u8 = 26;
 const ATTR_DHCP_AGENT_CIRCUIT_ID: u8 = 82;
 
-pub fn dump(label: &str, req_packet: &Packet) {
-    let bytes = match req_packet.encode() {
-        Ok(b) => b,
-        Err(e) => {
-            info!(
-                "[{}] could not re-encode request to dump AVPs: {:?}",
-                label, e
-            );
-            return;
-        }
-    };
-    if bytes.len() <= HEADER_LEN {
-        info!("[{}] no AVPs", label);
-        return;
-    }
-
+pub fn dump(label: &str, request: &Request<'_>) {
     info!(
-        "[{}] code={} id={} len={} AVPs:",
+        "[{}] code={:?} id={} from={}",
         label,
-        bytes[0],
-        bytes[1],
-        bytes.len()
+        request.code(),
+        request.identifier(),
+        request.src()
     );
 
-    let mut i = HEADER_LEN;
-    while i + 2 <= bytes.len() {
-        let typ = bytes[i];
-        let len = bytes[i + 1] as usize;
-        if len < 2 || i + len > bytes.len() {
-            info!("  malformed AVP at offset {} (len={})", i, len);
-            break;
+    let mut any = false;
+    for slot in request.attributes_iter() {
+        any = true;
+        match slot {
+            Ok(raw) => log_avp(raw.attribute_type(), raw.value()),
+            Err(e) => {
+                info!("  malformed AVP: {}", e);
+                break;
+            }
         }
-        let value = &bytes[i + 2..i + len];
-        log_avp(typ, value);
-        i += len;
+    }
+    if !any {
+        info!("[{}] no AVPs", label);
     }
 }
 
