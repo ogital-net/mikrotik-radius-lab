@@ -2,3 +2,4 @@ images/
 .run/
 radius-server/target/
 mikrotik-ingester/target/
+dhcp-server/target/*
