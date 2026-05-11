@@ -492,7 +492,7 @@ start_chr_core() {
             -device virtio-net-pci,netdev=down,mac=52:54:00:00:c0:01 \
             -netdev user,id=wan,hostfwd=tcp::2222-:22,hostfwd=tcp::8291-:8291 \
             -device virtio-net-pci,netdev=wan,mac=52:54:00:00:c0:02 \
-            "${server_nic_args[@]}" \
+            ${server_nic_args[@]+"${server_nic_args[@]}"} \
             -vga none \
             -serial tcp::4444,server,nowait \
             -display none \
@@ -509,7 +509,7 @@ start_chr_core() {
             -device virtio-net-pci,netdev=down,mac=52:54:00:00:c0:01 \
             -netdev user,id=wan,hostfwd=tcp::2222-:22,hostfwd=tcp::8291-:8291 \
             -device virtio-net-pci,netdev=wan,mac=52:54:00:00:c0:02 \
-            "${server_nic_args[@]}" \
+            ${server_nic_args[@]+"${server_nic_args[@]}"} \
             -serial tcp::4444,server,nowait \
             -display none \
             &
