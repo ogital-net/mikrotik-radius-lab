@@ -62,6 +62,7 @@ fn is_mac_string(s: &str) -> bool {
     }
 }
 
+#[derive(Clone)]
 pub struct Handler {
     pub db: SqlitePool,
     pub audit_tx: mpsc::Sender<audit::SessionEvent>,
