@@ -36,6 +36,7 @@ GUEST_ARCH="auto"
 LAB="hotspot"
 SWAP_LINES=0
 DHCP_BACKEND="routeros"
+FRESH=0
 
 for arg in "$@"; do
     case "$arg" in
@@ -46,6 +47,7 @@ for arg in "$@"; do
         --dhcp=routeros) DHCP_BACKEND="routeros" ;;
         --dhcp=external) DHCP_BACKEND="external" ;;
         --swap)         SWAP_LINES=1 ;;
+        --fresh)        FRESH=1 ;;
         --stop|stop)    ACTION="stop" ;;
         --help|-h)      ACTION="help" ;;
         *) err "Unknown argument: $arg"; exit 1 ;;
@@ -163,6 +165,20 @@ prepare_chr_overlay() {
         qemu-img create -f qcow2 -F raw -b "$CHR_IMG" "$overlay" >/dev/null
     fi
     echo "$overlay"
+}
+
+wipe_chr_overlays() {
+    local removed=0
+    for f in "$IMAGES_DIR"/chr-*-overlay.qcow2 "$IMAGES_DIR"/efivars-*.fd; do
+        [ -f "$f" ] || continue
+        rm -f "$f"
+        removed=$((removed + 1))
+    done
+    if [ "$removed" -gt 0 ]; then
+        log "Wiped $removed CHR overlay file(s) for fresh boot"
+    else
+        info "No CHR overlays to wipe"
+    fi
 }
 
 # ─── Dependency check ───────────────────────────────────────────
@@ -866,6 +882,11 @@ show_help() {
     --swap          (dhcp lab) Swap VM-A and VM-B socket ports — VM-A
                     on line B (:22223) and VM-B on line A (:22221).
                     Used to verify policy follows the wire (T3).
+    --fresh         Wipe CHR overlay disks before boot so every CHR comes
+                    up with a clean RouterOS. Use whenever you switch
+                    between --lab=hotspot and --lab=dhcp, or between
+                    --dhcp=routeros and --dhcp=external — leftover config
+                    from the previous mode otherwise contaminates the run.
     --stop          Stop all running components
     --help          Show this help
 
@@ -920,6 +941,9 @@ main() {
 
     check_deps
     download_images
+    if [ "$FRESH" = "1" ]; then
+        wipe_chr_overlays
+    fi
     build_radius
     build_ingester
     if [ "$LAB" = "dhcp" ] && [ "$DHCP_BACKEND" = "external" ]; then
