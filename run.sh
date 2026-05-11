@@ -13,6 +13,7 @@ IMAGES_DIR="$SCRIPT_DIR/images"
 CONFIGS_DIR="$SCRIPT_DIR/configs"
 RADIUS_DIR="$SCRIPT_DIR/radius-server"
 INGESTER_DIR="$SCRIPT_DIR/mikrotik-ingester"
+DHCP_DIR="$SCRIPT_DIR/dhcp-server"
 PID_DIR="$SCRIPT_DIR/.run"
 
 HOST_ARCH="$(uname -m)"
@@ -34,6 +35,7 @@ ACTION="run"
 GUEST_ARCH="auto"
 LAB="hotspot"
 SWAP_LINES=0
+DHCP_BACKEND="routeros"
 
 for arg in "$@"; do
     case "$arg" in
@@ -41,6 +43,8 @@ for arg in "$@"; do
         x64|x86_64|x86|amd64) GUEST_ARCH="x64" ;;
         --lab=hotspot)  LAB="hotspot" ;;
         --lab=dhcp)     LAB="dhcp" ;;
+        --dhcp=routeros) DHCP_BACKEND="routeros" ;;
+        --dhcp=external) DHCP_BACKEND="external" ;;
         --swap)         SWAP_LINES=1 ;;
         --stop|stop)    ACTION="stop" ;;
         --help|-h)      ACTION="help" ;;
@@ -245,6 +249,12 @@ build_ingester() {
     log "Ingester built"
 }
 
+build_dhcp_server() {
+    log "Building dhcp-server..."
+    (cd "$DHCP_DIR" && cargo build --release 2>&1 | tail -5)
+    log "dhcp-server built"
+}
+
 start_clickhouse() {
     log "Starting ClickHouse via docker compose..."
     (cd "$INGESTER_DIR" && docker compose up -d) >/dev/null 2>&1 || {
@@ -280,6 +290,33 @@ start_ingester() {
 }
 
 # ─── Start RADIUS ──────────────────────────────────────────────
+
+start_dhcp_server() {
+    mkdir -p "$PID_DIR"
+    log "Starting dhcp-server (external DHCP backend)..."
+    log "Waiting a moment for CHR-CORE :22229 listener to be ready..."
+    for _ in $(seq 1 30); do
+        if nc -z 127.0.0.1 22229 2>/dev/null; then
+            break
+        fi
+        sleep 1
+    done
+
+    RUST_LOG=info "$DHCP_DIR/target/release/dhcp-server" \
+        --qemu 127.0.0.1:22229 \
+        --radius 127.0.0.1:1812 \
+        --radius-secret secret \
+        > "$PID_DIR/dhcp-server.log" 2>&1 &
+    echo $! > "$PID_DIR/dhcp-server.pid"
+
+    sleep 1
+    if kill -0 "$(cat "$PID_DIR/dhcp-server.pid")" 2>/dev/null; then
+        log "dhcp-server running (PID $(cat "$PID_DIR/dhcp-server.pid"))"
+    else
+        err "dhcp-server failed to start; see $PID_DIR/dhcp-server.log"
+        exit 1
+    fi
+}
 
 start_radius() {
     mkdir -p "$PID_DIR"
@@ -412,6 +449,14 @@ start_chr_core() {
     local overlay
     overlay="$(prepare_chr_overlay core)"
 
+    local server_nic_args=()
+    if [ "$DHCP_BACKEND" = "external" ]; then
+        server_nic_args=(
+            -netdev socket,id=server,listen=:22229
+            -device virtio-net-pci,netdev=server,mac=52:54:00:00:c0:03
+        )
+    fi
+
     if [ "$GUEST_ARCH" = "arm64" ]; then
         local efi_code efi_vars
         efi_code="$(find_efi_code)"
@@ -431,6 +476,7 @@ start_chr_core() {
             -device virtio-net-pci,netdev=down,mac=52:54:00:00:c0:01 \
             -netdev user,id=wan,hostfwd=tcp::2222-:22,hostfwd=tcp::8291-:8291 \
             -device virtio-net-pci,netdev=wan,mac=52:54:00:00:c0:02 \
+            "${server_nic_args[@]}" \
             -vga none \
             -serial tcp::4444,server,nowait \
             -display none \
@@ -447,6 +493,7 @@ start_chr_core() {
             -device virtio-net-pci,netdev=down,mac=52:54:00:00:c0:01 \
             -netdev user,id=wan,hostfwd=tcp::2222-:22,hostfwd=tcp::8291-:8291 \
             -device virtio-net-pci,netdev=wan,mac=52:54:00:00:c0:02 \
+            "${server_nic_args[@]}" \
             -serial tcp::4444,server,nowait \
             -display none \
             &
@@ -681,9 +728,17 @@ configure_dhcp_lab() {
     log "Waiting ${boot_wait}s for both CHRs to boot..."
     sleep "$boot_wait"
     log "Configuring CHR-ACCESS (serial :4445)..."
-    apply_chr_config 4445 "$CONFIGS_DIR/mikrotik-access.rsc" "access"
+    if [ "$DHCP_BACKEND" = "external" ]; then
+        apply_chr_config 4445 "$CONFIGS_DIR/mikrotik-access-relay.rsc" "access (per-port relays)"
+    else
+        apply_chr_config 4445 "$CONFIGS_DIR/mikrotik-access.rsc" "access"
+    fi
     log "Configuring CHR-CORE (serial :4444)..."
-    apply_chr_config 4444 "$CONFIGS_DIR/mikrotik-core.rsc" "core"
+    if [ "$DHCP_BACKEND" = "external" ]; then
+        apply_chr_config 4444 "$CONFIGS_DIR/mikrotik-core-relay.rsc" "core (router only)"
+    else
+        apply_chr_config 4444 "$CONFIGS_DIR/mikrotik-core.rsc" "core"
+    fi
     apply_chr_config 4444 "$CONFIGS_DIR/mikrotik-logging.rsc" "logging"
 }
 
@@ -801,6 +856,13 @@ show_help() {
     --lab=hotspot   HotSpot lab (default): one CHR + one Lubuntu, captive portal
     --lab=dhcp      Option 82 lab: CHR-ACCESS + CHR-CORE + two Lubuntus,
                     DHCP-driven RADIUS subscriber identification
+    --dhcp=routeros (dhcp lab, default) CHR-CORE runs RouterOS' built-in
+                    DHCP server with use-radius=yes — models a small ISP
+                    where one Mikrotik does everything.
+    --dhcp=external (dhcp lab) CHR-CORE acts as a DHCP relay; an external
+                    dhcp-server (Rust, on the host) hands out leases —
+                    models a large ISP / enterprise where DHCP is a
+                    separate box (Kea, ISC, Windows DHCP).
     --swap          (dhcp lab) Swap VM-A and VM-B socket ports — VM-A
                     on line B (:22223) and VM-B on line A (:22221).
                     Used to verify policy follows the wire (T3).
@@ -844,7 +906,7 @@ main() {
         echo -e "${CYAN}  ║       Captive Portal Lab (x64)        ║${NC}"
     fi
     echo -e "${CYAN}  ╚═══════════════════════════════════════╝${NC}"
-    info "lab=$LAB"
+    info "lab=$LAB dhcp=$DHCP_BACKEND"
     echo ""
 
     if [ "$GUEST_ARCH" = "arm64" ]; then
@@ -860,6 +922,9 @@ main() {
     download_images
     build_radius
     build_ingester
+    if [ "$LAB" = "dhcp" ] && [ "$DHCP_BACKEND" = "external" ]; then
+        build_dhcp_server
+    fi
 
     echo ""
     log "Setup complete. Starting lab..."
@@ -909,6 +974,9 @@ main_dhcp() {
     start_chr_access
     sleep 2
     start_chr_core
+    if [ "$DHCP_BACKEND" = "external" ]; then
+        start_dhcp_server
+    fi
     start_vm_a
     start_vm_b
 

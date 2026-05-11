@@ -73,20 +73,20 @@ async fn init(db: &SqlitePool) {
              (circuit_id, plan, fixed_ip, pool_name, rate_limit, session_timeout, status, notes)
              VALUES
              (?, ?, ?, NULL, ?, ?, 'active', ?),
-             (?, ?, NULL, ?, ?, ?, 'active', ?)",
+             (?, ?, ?, NULL, ?, ?, 'active', ?)",
         )
         .bind("ether2")
         .bind("100mbps-static")
-        .bind("192.168.50.10")
+        .bind("192.168.10.10")
         .bind("100M/100M")
         .bind(3600_i64)
-        .bind("Lab line A — fixed-IP. circuit_id is the bridge default (ingress port name) since RouterOS 7.21.4 has no per-port dhcp-snooping-circuit-id property to override it.")
+        .bind("Lab line A — fixed-IP. circuit_id matches CHR-ACCESS port name (set via relay-info-remote-id in external-DHCP mode, or the bridge default in routeros mode). 192.168.10.10 is on line A's per-port subnet (external mode); routeros mode falls back to pool allocation since the bridge subnet differs.")
         .bind("ether3")
-        .bind("50mbps-pool")
-        .bind("lab-pool-50")
+        .bind("50mbps-static")
+        .bind("192.168.20.10")
         .bind("50M/50M")
         .bind(3600_i64)
-        .bind("Lab line B — pool. Same Circuit-Id-from-port-name caveat as line A.")
+        .bind("Lab line B — fixed-IP on line B's per-port subnet (192.168.20.0/24 in external-DHCP mode).")
         .execute(db)
         .await
         .expect("failed to seed subscriber_lines");

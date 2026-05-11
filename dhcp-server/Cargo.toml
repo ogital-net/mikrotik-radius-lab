@@ -1,0 +1,15 @@
+[package]
+name = "dhcp-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dhcproto = "0.12"
+etherparse = "0.15"
+log = "0.4"
+env_logger = "0.11"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+hmac = "0.12"
+md-5 = "0.10"
+rand = "0.8"
