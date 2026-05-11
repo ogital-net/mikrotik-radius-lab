@@ -1,4 +1,6 @@
 mod config;
+mod flow_listener;
+mod ipfix;
 mod listener;
 mod migrate;
 mod mikrotik;
@@ -43,7 +45,20 @@ async fn main() -> anyhow::Result<()> {
     let (tx, rx) = pipeline::channel();
 
     let pipeline_handle = tokio::spawn(pipeline::run(client.clone(), rx));
-    let listener_handle = tokio::spawn(listener::run(cfg.listen_addr, tx, shutdown.clone()));
+    let listener_handle =
+        tokio::spawn(listener::run(cfg.listen_addr, tx.clone(), shutdown.clone()));
+    let ipfix_handle = if cfg.ipfix_enabled {
+        Some(tokio::spawn(flow_listener::run(
+            cfg.ipfix_listen_addr,
+            cfg.default_sampling_interval,
+            tx.clone(),
+            shutdown.clone(),
+        )))
+    } else {
+        info!("ipfix listener disabled (INGESTER_IPFIX_ENABLED=false)");
+        None
+    };
+    drop(tx);
 
     tokio::signal::ctrl_c().await?;
     info!("shutdown signal received; draining in-flight events");
@@ -52,6 +67,11 @@ async fn main() -> anyhow::Result<()> {
     let drain = async move {
         if let Err(e) = listener_handle.await {
             error!(?e, "listener task panicked");
+        }
+        if let Some(h) = ipfix_handle
+            && let Err(e) = h.await
+        {
+            error!(?e, "ipfix listener task panicked");
         }
         match pipeline_handle.await {
             Ok(Ok(())) => info!("pipeline drained cleanly"),

@@ -737,6 +737,7 @@ configure_mikrotik() {
     log "Configuring RouterOS via serial (expect)..."
     apply_chr_config 4444 "$CONFIGS_DIR/mikrotik-hotspot.rsc" "hotspot"
     apply_chr_config 4444 "$CONFIGS_DIR/mikrotik-logging.rsc" "logging"
+    apply_chr_config 4444 "$CONFIGS_DIR/mikrotik-traffic-flow.rsc" "traffic-flow"
 }
 
 configure_dhcp_lab() {
@@ -756,6 +757,7 @@ configure_dhcp_lab() {
         apply_chr_config 4444 "$CONFIGS_DIR/mikrotik-core.rsc" "core"
     fi
     apply_chr_config 4444 "$CONFIGS_DIR/mikrotik-logging.rsc" "logging"
+    apply_chr_config 4444 "$CONFIGS_DIR/mikrotik-traffic-flow.rsc" "traffic-flow"
 }
 
 # ─── Upload custom HotSpot HTML to Mikrotik via SCP ──────────

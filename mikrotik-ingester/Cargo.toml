@@ -17,6 +17,7 @@ time = { version = "0.3", features = ["serde", "macros"] }
 syslog_loose = "0.23.0"
 chrono = { version = "0.4.44", default-features = false, features = ["std"] }
 regex = "1"
+ipfix-parser = { git = "https://github.com/ogital-net/ipfix-parser.git", features = ["std-store"] }
 
 [profile.release]
 lto = "thin"

@@ -1,4 +1,4 @@
-use crate::model::{FirewallEvent, Message, RawLogRow};
+use crate::model::{FirewallEvent, FlowEvent, Message, RawLogRow};
 use clickhouse::{Client, inserter::Inserter};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -19,11 +19,16 @@ pub async fn run(client: Client, mut rx: mpsc::Receiver<Message>) -> anyhow::Res
         .with_period(Some(Duration::from_secs(5)))
         .with_max_rows(100_000)
         .with_max_bytes(50_000_000);
+    let mut flows = client
+        .inserter::<FlowEvent>("flows")?
+        .with_period(Some(Duration::from_secs(5)))
+        .with_max_rows(100_000)
+        .with_max_bytes(50_000_000);
 
     info!("inserters started");
 
     loop {
-        let timeout = min_left(&mut fw, &mut raw);
+        let timeout = min_left(&mut fw, &mut raw, &mut flows);
 
         tokio::select! {
             maybe_msg = rx.recv() => {
@@ -38,6 +43,11 @@ pub async fn run(client: Client, mut rx: mpsc::Receiver<Message>) -> anyhow::Res
                             error!(?e, "raw.write failed");
                         }
                     }
+                    Some(Message::Flow(ev)) => {
+                        if let Err(e) = flows.write(&ev) {
+                            error!(?e, "flows.write failed");
+                        }
+                    }
                     None => break,
                 }
             }
@@ -46,23 +56,32 @@ pub async fn run(client: Client, mut rx: mpsc::Receiver<Message>) -> anyhow::Res
 
         commit("firewall_connections", &mut fw).await;
         commit("raw_log", &mut raw).await;
+        commit("flows", &mut flows).await;
     }
 
     let s_fw = fw.end().await?;
     let s_raw = raw.end().await?;
-    info!(fw_rows = s_fw.rows, raw_rows = s_raw.rows, "final flush");
+    let s_flows = flows.end().await?;
+    info!(
+        fw_rows = s_fw.rows,
+        raw_rows = s_raw.rows,
+        flow_rows = s_flows.rows,
+        "final flush"
+    );
     Ok(())
 }
 
-fn min_left<A, B>(a: &mut Inserter<A>, b: &mut Inserter<B>) -> Duration
+fn min_left<A, B, C>(a: &mut Inserter<A>, b: &mut Inserter<B>, c: &mut Inserter<C>) -> Duration
 where
     A: clickhouse::Row,
     B: clickhouse::Row,
+    C: clickhouse::Row,
 {
     let fallback = Duration::from_secs(5);
     let ta = a.time_left().unwrap_or(fallback);
     let tb = b.time_left().unwrap_or(fallback);
-    ta.min(tb).max(Duration::from_millis(50))
+    let tc = c.time_left().unwrap_or(fallback);
+    ta.min(tb).min(tc).max(Duration::from_millis(50))
 }
 
 async fn commit<T>(name: &str, ins: &mut Inserter<T>)
