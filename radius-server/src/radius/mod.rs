@@ -1,11 +1,11 @@
 use crate::audit;
-use log::info;
 use radius_tokio::dict::generated::rfc::attrs;
 use radius_tokio::server::{Handler, HandlerResult, Request};
 use radius_tokio::typed::{Attr, VsaAttr, WText, WireType};
 use radius_tokio::Code;
 use sqlx::SqlitePool;
 use tokio::sync::mpsc;
+use tracing::{debug, info};
 
 pub mod accounting;
 pub mod dhcp;
@@ -40,10 +40,7 @@ pub fn first<'a, T: WireType>(request: &Request<'a>, attr: Attr<T>) -> Option<T:
     None
 }
 
-pub fn first_vsa<'a, T: WireType>(
-    request: &Request<'a>,
-    attr: VsaAttr<T>,
-) -> Option<T::View<'a>> {
+pub fn first_vsa<'a, T: WireType>(request: &Request<'a>, attr: VsaAttr<T>) -> Option<T::View<'a>> {
     for slot in request.attributes_iter() {
         let raw = slot.ok()?;
         if let Some(v) = raw.get_vsa(attr) {
@@ -90,6 +87,21 @@ pub struct AppHandler {
 impl Handler for AppHandler {
     async fn handle(&self, request: Request<'_>) -> HandlerResult {
         info!("RADIUS {:?} from {}", request.code(), request.src());
+
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            use std::fmt::Write;
+            let mut buf = format!(
+                "RADIUS dissect — code={:?} id={} from {} auth={:02x?}",
+                request.code(),
+                request.identifier(),
+                request.src(),
+                request.authenticator()
+            );
+            for raw in request.attributes_iter().filter_map(Result::ok) {
+                let _ = write!(buf, "\n    {}", raw.dissect());
+            }
+            debug!("{}", buf);
+        }
 
         match request.code() {
             Code::ACCESS_REQUEST => match classify(&request) {

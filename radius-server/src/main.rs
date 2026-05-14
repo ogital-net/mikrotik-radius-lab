@@ -4,23 +4,100 @@ mod radius;
 mod subscribers;
 mod web;
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::future::Future;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::process;
 use std::sync::Arc;
 
 use clickhouse::Client;
-use log::{info, warn};
-use radius_tokio::server::{Client as RadiusClient, IpCidr, Server, StaticClients};
+use radius_tokio::server::{Client as RadiusClient, ClientStore, IpCidr, Server, StaticClients};
+use radius_tokio::tls::{PeerCertificate, TlsContext};
 use tokio::signal;
+use tracing::{info, warn};
+use tracing_subscriber::EnvFilter;
 
 const SECRET: &[u8] = b"secret";
+const RADSEC_SECRET: &[u8] = b"radsec";
 const WEB_PORT: u16 = 8080;
 const RADIUS_AUTH_PORT: u16 = 1812;
 const RADIUS_ACCT_PORT: u16 = 1813;
+const RADSEC_PORT_DEFAULT: u16 = 2083;
+
+struct RadsecConfig {
+    client: Arc<RadiusClient>,
+    expected_hostname: Option<String>,
+}
+
+struct MixedStore {
+    udp: StaticClients,
+    radsec: Option<RadsecConfig>,
+}
+
+impl ClientStore for MixedStore {
+    fn lookup_udp(
+        &self,
+        src: SocketAddr,
+    ) -> impl Future<Output = Option<Arc<RadiusClient>>> + Send {
+        self.udp.lookup_udp(src)
+    }
+
+    fn admit_radsec(&self, _src: SocketAddr) -> impl Future<Output = bool> + Send {
+        let allow = self.radsec.is_some();
+        async move { allow }
+    }
+
+    fn lookup_radsec_by_cert(
+        &self,
+        _src: SocketAddr,
+        peer: &PeerCertificate,
+    ) -> impl Future<Output = Option<Arc<RadiusClient>>> + Send {
+        let resolved = self
+            .radsec
+            .as_ref()
+            .and_then(|cfg| match &cfg.expected_hostname {
+                Some(name) if peer.matches_hostname(name, false) => Some(Arc::clone(&cfg.client)),
+                None => Some(Arc::clone(&cfg.client)),
+                _ => None,
+            });
+        async move { resolved }
+    }
+}
+
+fn load_radsec_from_env() -> Result<Option<(RadsecConfig, TlsContext, SocketAddr)>, anyhow::Error> {
+    let (Ok(cert_path), Ok(key_path), Ok(ca_path)) = (
+        std::env::var("RADSEC_SERVER_CERT"),
+        std::env::var("RADSEC_SERVER_KEY"),
+        std::env::var("RADSEC_CLIENT_CA"),
+    ) else {
+        return Ok(None);
+    };
+
+    let cert_pem = std::fs::read(&cert_path)?;
+    let key_pem = std::fs::read(&key_path)?;
+    let ca_pem = std::fs::read(&ca_path)?;
+    let tls = TlsContext::server(&cert_pem, &key_pem, &ca_pem)?;
+
+    let port: u16 = std::env::var("RADSEC_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(RADSEC_PORT_DEFAULT);
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
+
+    let cfg = RadsecConfig {
+        client: Arc::new(RadiusClient::new(RADSEC_SECRET)),
+        expected_hostname: std::env::var("RADSEC_CLIENT_NAME").ok(),
+    };
+
+    Ok(Some((cfg, tls, addr)))
+}
 
 #[tokio::main]
-async fn main() {
-    env_logger::init();
+async fn main() -> Result<(), anyhow::Error> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
 
     let pool = db::connect("sqlite:latigo.db?mode=rwc").await;
 
@@ -55,7 +132,7 @@ async fn main() {
     };
 
     let shared = Arc::new(RadiusClient::new(SECRET));
-    let clients = StaticClients::builder()
+    let udp = StaticClients::builder()
         .add(
             IpCidr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0).unwrap(),
             Arc::clone(&shared),
@@ -66,13 +143,28 @@ async fn main() {
         )
         .build();
 
-    let server = Server::builder()
-        .clients(clients)
+    let (radsec_cfg, radsec_listener) = match load_radsec_from_env()? {
+        Some((cfg, tls, addr)) => (Some(cfg), Some((tls, addr))),
+        None => (None, None),
+    };
+
+    let store = MixedStore {
+        udp,
+        radsec: radsec_cfg,
+    };
+
+    let mut builder = Server::builder()
+        .clients(store)
         .handler(handler)
         .listen_udp(format!("0.0.0.0:{}", RADIUS_AUTH_PORT).parse().unwrap())
-        .listen_udp(format!("0.0.0.0:{}", RADIUS_ACCT_PORT).parse().unwrap())
-        .build()
-        .unwrap();
+        .listen_udp(format!("0.0.0.0:{}", RADIUS_ACCT_PORT).parse().unwrap());
+
+    if let Some((tls, addr)) = radsec_listener {
+        builder = builder.listen_radsec(addr, tls);
+        info!("RadSec (RFC 6614) listening on {}", addr);
+    }
+
+    let server = builder.build().unwrap();
     let shutdown = server.shutdown_handle();
 
     info!("RADIUS auth listening on 0.0.0.0:{}", RADIUS_AUTH_PORT);
@@ -99,4 +191,5 @@ async fn main() {
     if radius_result.is_err() {
         process::exit(1);
     }
+    Ok(())
 }

@@ -16,6 +16,7 @@
 /ip dhcp-server network add address=192.168.10.0/24 gateway=192.168.10.1 dns-server=8.8.8.8,8.8.4.4
 /ip dhcp-server network add address=192.168.20.0/24 gateway=192.168.20.1 dns-server=8.8.8.8,8.8.4.4
 
-/radius add service=dhcp address=10.0.2.2 secret=secret authentication-port=1812 accounting-port=1813 timeout=3s
+# RADIUS is configured separately (RadSec) — see mikrotik-core-radsec.rsc,
+# applied after the host SCPs ca.crt / client.crt / client.key into /file.
 
 /ip firewall nat add chain=srcnat out-interface=ether2 action=masquerade

@@ -15,8 +15,9 @@
 # NAT masquerade
 /ip firewall nat add chain=srcnat out-interface=ether1 action=masquerade
 
-# RADIUS server (host machine via QEMU NAT gateway = 10.0.2.2)
-/radius add service=hotspot address=10.0.2.2 secret=secret authentication-port=1812 accounting-port=1812
+# RADIUS is configured separately (RadSec) — see mikrotik-hotspot-radsec.rsc.
+# That file is applied after the host SCPs ca.crt / client.crt / client.key
+# into /file, so the /certificate import calls have something to read.
 
 # HotSpot profile + server
 /ip hotspot profile add name=hsprof1 hotspot-address=192.168.88.1 dns-name=hotspot.lab login-by=http-pap use-radius=yes radius-interim-update=5m

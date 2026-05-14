@@ -14,6 +14,7 @@ CONFIGS_DIR="$SCRIPT_DIR/configs"
 RADIUS_DIR="$SCRIPT_DIR/radius-server"
 INGESTER_DIR="$SCRIPT_DIR/mikrotik-ingester"
 DHCP_DIR="$SCRIPT_DIR/dhcp-server"
+RADSEC_CERTS_DIR="$SCRIPT_DIR/radsec-certs"
 PID_DIR="$SCRIPT_DIR/.run"
 
 HOST_ARCH="$(uname -m)"
@@ -336,10 +337,32 @@ start_dhcp_server() {
 
 start_radius() {
     mkdir -p "$PID_DIR"
-    log "Starting RADIUS server on 0.0.0.0:1812..."
 
-    RUST_LOG=info "$RADIUS_DIR/target/release/radius-server" \
-        > "$PID_DIR/radius.log" 2>&1 &
+    local server_crt="$RADSEC_CERTS_DIR/server.crt"
+    local server_key="$RADSEC_CERTS_DIR/server.key"
+    local client_ca="$RADSEC_CERTS_DIR/ca.crt"
+    local radsec_ready=0
+    if [ -f "$server_crt" ] && [ -f "$server_key" ] && [ -f "$client_ca" ]; then
+        radsec_ready=1
+    fi
+
+    if [ "$radsec_ready" = "1" ]; then
+        log "Starting RADIUS server on UDP/1812+1813 and RadSec/2083..."
+        RUST_LOG="${RUST_LOG:-info}" \
+        RADSEC_SERVER_CERT="$server_crt" \
+        RADSEC_SERVER_KEY="$server_key" \
+        RADSEC_CLIENT_CA="$client_ca" \
+        RADSEC_CLIENT_NAME="${RADSEC_CLIENT_NAME:-mikrotik-edge-01}" \
+            "$RADIUS_DIR/target/release/radius-server" \
+            > "$PID_DIR/radius.log" 2>&1 &
+    else
+        warn "RadSec PKI not found at $RADSEC_CERTS_DIR/"
+        info "Generate with: (cd radius-server && cargo run --bin radsec-pki -- --out-dir $RADSEC_CERTS_DIR)"
+        log "Starting RADIUS server on UDP/1812+1813 only..."
+        RUST_LOG="${RUST_LOG:-info}" "$RADIUS_DIR/target/release/radius-server" \
+            > "$PID_DIR/radius.log" 2>&1 &
+    fi
+    info "RADIUS server logs: $PID_DIR/radius.log (RUST_LOG=${RUST_LOG:-info})"
     echo $! > "$PID_DIR/radius.pid"
 
     sleep 1
@@ -714,16 +737,27 @@ apply_chr_config() {
     local serial_port="$1"
     local config_file="$2"
     local label="${3:-$(basename "$config_file")}"
-    local expect_script
+    local expect_script log_path slug rc=0
     expect_script="$(mktemp /tmp/mikrotik-config.XXXXXX.exp)"
     write_chr_expect_script "$expect_script"
-    expect "$expect_script" "$serial_port" "$config_file"
-    local rc=$?
+    mkdir -p "$PID_DIR"
+    slug="$(basename "$config_file" .rsc)"
+    log_path="$PID_DIR/chr-${slug}.log"
+
+    # Tee the raw expect session to a per-config log (open with `less -R`
+    # to render the RouterOS colors) and strip ANSI escape codes from the
+    # copy that lands in the user's terminal so RouterOS's clear-screen
+    # sequence (\033[2J) doesn't wipe the scrollback.
+    expect "$expect_script" "$serial_port" "$config_file" 2>&1 \
+        | tee "$log_path" \
+        | perl -pe 'BEGIN { $| = 1 } s/\e\[[0-9;?]*[A-Za-z]//g; s/\e[()][A-Z0-9]//g; s/\r$//' \
+        || rc=$?
+
     rm -f "$expect_script"
     if [ $rc -eq 0 ]; then
-        log "Applied $label on serial :$serial_port"
+        log "Applied $label on serial :$serial_port (raw log: $log_path)"
     else
-        warn "Auto-config may have failed for $label (serial :$serial_port, rc=$rc)"
+        warn "Auto-config may have failed for $label (serial :$serial_port, rc=$rc; raw log: $log_path)"
         info "Connect manually: socat -,rawer tcp:localhost:$serial_port"
         info "Then paste commands from: $config_file"
     fi
@@ -738,6 +772,9 @@ configure_mikrotik() {
     apply_chr_config 4444 "$CONFIGS_DIR/mikrotik-hotspot.rsc" "hotspot"
     apply_chr_config 4444 "$CONFIGS_DIR/mikrotik-logging.rsc" "logging"
     apply_chr_config 4444 "$CONFIGS_DIR/mikrotik-traffic-flow.rsc" "traffic-flow"
+    if upload_radsec_certs; then
+        apply_chr_config 4444 "$CONFIGS_DIR/mikrotik-hotspot-radsec.rsc" "hotspot radsec"
+    fi
 }
 
 configure_dhcp_lab() {
@@ -758,6 +795,13 @@ configure_dhcp_lab() {
     fi
     apply_chr_config 4444 "$CONFIGS_DIR/mikrotik-logging.rsc" "logging"
     apply_chr_config 4444 "$CONFIGS_DIR/mikrotik-traffic-flow.rsc" "traffic-flow"
+    # CORE is the only CHR with /radius (DHCP server with use-radius=yes);
+    # the core-relay variant doesn't need RADIUS at all.
+    if [ "$DHCP_BACKEND" != "external" ]; then
+        if upload_radsec_certs; then
+            apply_chr_config 4444 "$CONFIGS_DIR/mikrotik-core-radsec.rsc" "core radsec"
+        fi
+    fi
 }
 
 # ─── Upload custom HotSpot HTML to Mikrotik via SCP ──────────
@@ -824,6 +868,78 @@ SCP_SCRIPT
         warn "Could not upload HTML files"
         info "Upload manually: scp -P 2222 configs/hotspot-html/*.html admin@localhost:/hotspot/"
     fi
+}
+
+# ─── Upload RadSec PKI to Mikrotik via SCP ──────────────────────
+# Must run AFTER configure_mikrotik (network needs to be up so SSH
+# is reachable) and BEFORE applying mikrotik-*-radsec.rsc (so the
+# /certificate import calls have the PEMs on /file).
+
+upload_radsec_certs() {
+    if [ ! -f "$RADSEC_CERTS_DIR/ca.crt" ] \
+       || [ ! -f "$RADSEC_CERTS_DIR/client.crt" ] \
+       || [ ! -f "$RADSEC_CERTS_DIR/client.key" ]; then
+        warn "RadSec PKI not found at $RADSEC_CERTS_DIR/ — skipping Mikrotik cert upload"
+        info "Generate with: (cd radius-server && cargo run --bin radsec-pki -- --out-dir $RADSEC_CERTS_DIR)"
+        return 1
+    fi
+
+    log "Uploading RadSec PKI to Mikrotik (SCP)..."
+
+    local expect_script
+    expect_script="$(mktemp /tmp/mikrotik-radsec-scp.XXXXXX.exp)"
+
+    cat > "$expect_script" << 'SCP_SCRIPT'
+set timeout 20
+set src [lindex $argv 0]
+set dst [lindex $argv 1]
+
+spawn scp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -P 2222 $src admin@localhost:$dst
+
+expect {
+    -re {[Pp]assword:} {
+        send "admin\r"
+        exp_continue
+    }
+    "100%" {
+        exit 0
+    }
+    eof {
+        exit 0
+    }
+    timeout {
+        exit 1
+    }
+}
+SCP_SCRIPT
+
+    local retries=10
+    for i in $(seq 1 $retries); do
+        if expect "$expect_script" /dev/null /dev/null 2>/dev/null; then
+            break
+        fi
+        sleep 3
+    done
+
+    local uploaded=0
+    for f in ca.crt client.crt client.key; do
+        if expect "$expect_script" "$RADSEC_CERTS_DIR/$f" "/$f"; then
+            info "  uploaded $f"
+            uploaded=$((uploaded + 1))
+        else
+            warn "  failed to upload $f"
+        fi
+    done
+
+    rm -f "$expect_script"
+
+    if [ "$uploaded" -eq 3 ]; then
+        log "Uploaded RadSec PKI (3 files)"
+        return 0
+    fi
+    warn "RadSec cert upload incomplete ($uploaded/3 files)"
+    info "Upload manually: scp -P 2222 $RADSEC_CERTS_DIR/{ca,client}.{crt,key} admin@localhost:/"
+    return 1
 }
 
 # ─── Stop all ───────────────────────────────────────────────────

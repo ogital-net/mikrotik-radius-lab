@@ -4,9 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-radius-tokio = { git = "https://github.com/ogital-net/radius-tokio.git", rev = "706bd98f8e5d0ff742322d2fc9652d2e393921fc", default-features = false, features = ["dict-rfc", "dict-mikrotik"] }
+radius-tokio = { git = "https://github.com/ogital-net/radius-tokio.git", branch = "main", default-features = false, features = ["dict-rfc", "dict-mikrotik", "radsec", "tracing"] }
 log = "0.4"
-env_logger = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "tracing-log"] }
 tokio = { version = "1", features = ["net", "signal", "macros", "rt-multi-thread", "fs"] }
 
 # Web server
